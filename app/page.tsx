@@ -2,1112 +2,916 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-/**
- * Sunsol demo – Quote calculator (no login)
- * OCR: LUMA Page 4 "CONSUMPTION HISTORY (KWH)" bar chart
- *
- * Key rules:
- * - Auto-crop by default (no manual crop UI)
- * - Discard Y axis regardless of its numbers (remove left axis by detection)
- * - Consider ONLY numbers above bars (top region)
- * - Candidate filter: 20–3000
- * - Use 12 most recent (right-most). If fewer but >=4: estimate annual = avg * 12
- */
-
-const PV_PRICE_PER_W = 2.3; // installed $/W
-const SOLUNA_PRICE_PER_KWH = 350; // $/kWh
-const DAYS_PER_MONTH = 30.4;
-const BATTERY_USABLE_FACTOR = 0.9; // usable fraction
-const MIN_MONTHS_FOR_OCR = 4;
-const OCR_MIN_KWH = 20;
-const OCR_MAX_KWH = 3000;
-
-const ROOF_ADDER: Record<string, number> = {
-  Shingle: 0,
-  Metal: 750,
-  "Flat/Concrete": 1200,
-  Tile: 1500,
-  Other: 800,
-};
-
-const CRITICAL_LOAD_OPTIONS = [
-  { label: "1.5 kW (típico)", value: 1.5 },
-  { label: "3.0 kW", value: 3.0 },
-  { label: "5.0 kW", value: 5.0 },
-  { label: "7.5 kW", value: 7.5 },
-];
-
-const BACKUP_HOURS_OPTIONS = [4, 8, 12];
-
-const BATTERY_OPTIONS_KWH = [5, 10, 16, 20, 32, 40];
-
-type BBox = { x0: number; y0: number; x1: number; y1: number };
-type OcrToken = { text: string; value?: number; conf: number; bbox: BBox };
-
 type OcrSummary = {
-  ok: boolean;
+  detectedAll: number[]; // en orden izquierda->derecha (los que pasen filtro)
+  used12MostRecent: number[]; // últimos 12 (o menos si hay <12)
+  monthsUsed: number; // cantidad usada en el cálculo
+  annualKwh: number; // 12m real o estimado
+  avgMonthlyKwh: number; // anual/12
+  confidencePct: number; // promedio confidencias (aprox)
+  status: "idle" | "working" | "ok" | "insufficient" | "error";
   message?: string;
-
-  // extracted monthly kWh series (right-most up to 12)
-  monthsUsed: number;
-  valuesUsed: number[];
-  valuesDetected: number[];
-  avgMonthly: number | null;
-  annualKWh: number | null;
-  avgConfidence: number | null;
-
-  // debug images
-  rawDataUrl?: string;
-  chartCropDataUrl?: string;
-  labelsCropDataUrl?: string;
 };
 
-function clamp(n: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, n));
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
 }
 
-function round2(n: number) {
-  return Math.round(n * 100) / 100;
-}
-
-function formatMoney(n: number) {
+function formatCurrency(n: number) {
   if (!isFinite(n)) return "—";
-  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 }
 
-function canvasToDataUrl(canvas: HTMLCanvasElement, quality = 0.92) {
-  try {
-    return canvas.toDataURL("image/jpeg", quality);
-  } catch {
-    return undefined;
-  }
+function formatNumber(n: number, digits = 2) {
+  if (!isFinite(n)) return "—";
+  return n.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
 }
 
-async function fileToImage(file: File): Promise<HTMLImageElement> {
-  const url = URL.createObjectURL(file);
-  try {
-    const img = new Image();
-    img.decoding = "async";
-    img.src = url;
-    await new Promise<void>((resolve, reject) => {
-      img.onload = () => resolve();
-      img.onerror = () => reject(new Error("No se pudo cargar la imagen."));
-    });
-    return img;
-  } finally {
-    // revoke later (after image is loaded)
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-  }
+async function fileToBitmap(file: File): Promise<ImageBitmap> {
+  // createImageBitmap es rápido y respeta orientación en la mayoría de browsers modernos
+  return await createImageBitmap(file);
 }
 
-function drawImageToCanvas(img: HTMLImageElement, maxW = 1800): HTMLCanvasElement {
-  const ratio = img.width / img.height;
-  const w = img.width > maxW ? maxW : img.width;
-  const h = Math.round(w / ratio);
+function canvasFromBitmap(bitmap: ImageBitmap, maxDim = 1600): HTMLCanvasElement {
+  const w = bitmap.width;
+  const h = bitmap.height;
+
+  const scale = Math.min(1, maxDim / Math.max(w, h));
+  const cw = Math.round(w * scale);
+  const ch = Math.round(h * scale);
+
   const c = document.createElement("canvas");
-  c.width = w;
-  c.height = h;
+  c.width = cw;
+  c.height = ch;
+
   const ctx = c.getContext("2d");
-  if (!ctx) return c;
-  ctx.drawImage(img, 0, 0, w, h);
+  if (!ctx) throw new Error("No canvas context");
+  ctx.drawImage(bitmap, 0, 0, cw, ch);
   return c;
 }
 
 function cropCanvas(src: HTMLCanvasElement, x: number, y: number, w: number, h: number): HTMLCanvasElement {
   const c = document.createElement("canvas");
-  c.width = Math.max(1, Math.floor(w));
-  c.height = Math.max(1, Math.floor(h));
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
   const ctx = c.getContext("2d");
-  if (!ctx) return c;
-  ctx.drawImage(src, x, y, c.width, c.height, 0, 0, c.width, c.height);
+  if (!ctx) throw new Error("No canvas context");
+  ctx.drawImage(src, x, y, w, h, 0, 0, c.width, c.height);
   return c;
 }
 
-/**
- * Find the horizontal band for the chart title bar by scanning downscaled grayscale rows.
- * Works even if numbers on Y axis change.
- */
-function findChartTitleBandY(src: HTMLCanvasElement) {
-  const W = src.width;
-  const H = src.height;
-
-  // Downscale for speed
-  const targetW = 420;
-  const scale = targetW / W;
-  const w = Math.min(targetW, W);
-  const h = Math.max(1, Math.round(H * scale));
-  const c = document.createElement("canvas");
-  c.width = w;
-  c.height = h;
-
-  const ctx = c.getContext("2d");
-  if (!ctx) return Math.round(H * 0.58);
-  ctx.drawImage(src, 0, 0, w, h);
-
-  const img = ctx.getImageData(0, 0, w, h);
-  const data = img.data;
-
-  const rowMean = new Float32Array(h);
-  const rowStd = new Float32Array(h);
-  const rowLightFrac = new Float32Array(h);
-
-  for (let y = 0; y < h; y++) {
-    let sum = 0;
-    let sumSq = 0;
-    let light = 0;
-
-    for (let x = 0; x < w; x++) {
-      const i = (y * w + x) * 4;
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-      sum += lum;
-      sumSq += lum * lum;
-
-      // "light gray" band tends to be ~210-245; white (255) excluded by upper bound below
-      if (lum >= 200 && lum <= 246) light++;
-    }
-    const mean = sum / w;
-    const varr = sumSq / w - mean * mean;
-    const std = Math.sqrt(Math.max(0, varr));
-
-    rowMean[y] = mean;
-    rowStd[y] = std;
-    rowLightFrac[y] = light / w;
-  }
-
-  // Moving window average
-  const win = 7;
-  function winAvg(arr: Float32Array, y: number) {
-    let s = 0;
-    let c = 0;
-    for (let k = -Math.floor(win / 2); k <= Math.floor(win / 2); k++) {
-      const yy = y + k;
-      if (yy >= 0 && yy < h) {
-        s += arr[yy];
-        c++;
-      }
-    }
-    return c ? s / c : arr[y];
-  }
-
-  const yMin = Math.round(h * 0.35);
-  const yMax = Math.round(h * 0.85);
-
-  let bestY = Math.round(h * 0.60);
-  let bestScore = -1e9;
-
-  for (let y = yMin; y <= yMax; y++) {
-    const mean = winAvg(rowMean, y);
-    const std = winAvg(rowStd, y);
-    const frac = winAvg(rowLightFrac, y);
-
-    // Score a "light gray bar with some text" (not pure white)
-    // We want: high light fraction, mean near ~230, and relatively low std (uniform-ish).
-    const meanPenalty = Math.abs(mean - 232) / 90; // 0..~1
-    const stdPenalty = std / 35; // 0..~1+
-    const score = frac * 2.2 - meanPenalty - stdPenalty;
-
-    // Keep only plausible rows
-    if (frac < 0.35) continue;
-    if (mean < 190 || mean > 250) continue;
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestY = y;
-    }
-  }
-
-  // Convert downscaled Y back to original canvas coordinates
-  const yOrig = Math.round(bestY / scale);
-  return clamp(yOrig, Math.round(H * 0.40), Math.round(H * 0.80));
+function getLumaAt(data: Uint8ClampedArray, idx: number) {
+  const r = data[idx];
+  const g = data[idx + 1];
+  const b = data[idx + 2];
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
-/**
- * Detect the Y-axis vertical line position inside a chart crop (left side).
- * We count dark pixels in the TOP portion (to avoid bars) and pick the strongest vertical line.
- */
-function findYAxisX(chart: HTMLCanvasElement) {
-  const W = chart.width;
-  const H = chart.height;
-  const ctx = chart.getContext("2d");
-  if (!ctx) return Math.round(W * 0.08);
-
-  const img = ctx.getImageData(0, 0, W, H);
-  const d = img.data;
-
-  const xMaxSearch = Math.round(W * 0.22);
-  const yTop = 0;
-  const yBottom = Math.round(H * 0.45); // avoid bars (bars are lower)
-
-  let bestX = Math.round(W * 0.08);
-  let bestCount = -1;
-
-  for (let x = 0; x < xMaxSearch; x++) {
-    let cnt = 0;
-    for (let y = yTop; y < yBottom; y++) {
-      const i = (y * W + x) * 4;
-      const r = d[i], g = d[i + 1], b = d[i + 2];
-      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-      if (lum < 90) cnt++;
-    }
-    if (cnt > bestCount) {
-      bestCount = cnt;
-      bestX = x;
-    }
-  }
-
-  return clamp(bestX, 0, Math.round(W * 0.25));
-}
-
-/**
- * Enhance canvas for OCR: upscale + grayscale + contrast + binarize.
- */
-function enhanceForOcr(src: HTMLCanvasElement, upscale = 2): HTMLCanvasElement {
-  const W = src.width;
-  const H = src.height;
-
-  const c = document.createElement("canvas");
-  c.width = W * upscale;
-  c.height = H * upscale;
+function binarizeInPlace(c: HTMLCanvasElement) {
   const ctx = c.getContext("2d");
-  if (!ctx) return src;
-
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(src, 0, 0, c.width, c.height);
-
+  if (!ctx) return;
   const img = ctx.getImageData(0, 0, c.width, c.height);
   const d = img.data;
 
-  // Simple contrast + threshold
-  // (Works well on printed grayscale charts)
-  const contrast = 1.25;
-  const threshold = 210;
-
+  // Binarización simple + contraste: texto negro sobre fondo blanco
   for (let i = 0; i < d.length; i += 4) {
-    const r = d[i], g = d[i + 1], b = d[i + 2];
-    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-
-    // contrast around mid
-    lum = (lum - 128) * contrast + 128;
-    lum = clamp(lum, 0, 255);
-
-    // binarize
-    const v = lum > threshold ? 255 : 0;
+    const l = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+    // umbral: ajustado para labels negros en fondo blanco
+    const v = l < 170 ? 0 : 255;
     d[i] = v;
     d[i + 1] = v;
     d[i + 2] = v;
-    d[i + 3] = 255;
   }
-
   ctx.putImageData(img, 0, 0);
+}
+
+function scaleCanvas(src: HTMLCanvasElement, scale: number): HTMLCanvasElement {
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(src.width * scale));
+  c.height = Math.max(1, Math.round(src.height * scale));
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("No canvas context");
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(src, 0, 0, c.width, c.height);
   return c;
 }
 
-function mergeAdjacentDigitTokens(tokens: OcrToken[]) {
-  // Keep only digit-like tokens (including single digits for merges)
-  const digitTokens = tokens
-    .filter((t) => /^\d+$/.test(t.text))
-    .map((t) => ({
-      ...t,
-      // normalize bbox
-      bbox: {
-        x0: t.bbox.x0,
-        y0: t.bbox.y0,
-        x1: t.bbox.x1,
-        y1: t.bbox.y1,
-      },
-    }));
+/**
+ * Encuentra bounds del "plot" (zona con barras) dentro de un recorte rough.
+ * La idea: detectar densidad de pixeles oscuros en una banda vertical/horizontal
+ * y recortar a donde realmente están las barras, evitando el eje Y y márgenes.
+ */
+function findPlotBounds(rough: HTMLCanvasElement) {
+  const ctx = rough.getContext("2d");
+  if (!ctx) throw new Error("No canvas context");
 
-  // Cluster by y-mid (same "row")
-  const rows: OcrToken[][] = [];
-  const yTol = 18; // px tolerance after OCR scaling
+  const w = rough.width;
+  const h = rough.height;
 
-  const sorted = digitTokens.sort((a, b) => {
-    const ay = (a.bbox.y0 + a.bbox.y1) / 2;
-    const by = (b.bbox.y0 + b.bbox.y1) / 2;
-    if (Math.abs(ay - by) > yTol) return ay - by;
-    return a.bbox.x0 - b.bbox.x0;
-  });
+  // Área donde esperamos barras (evita encabezado y pie)
+  const y0 = Math.floor(h * 0.10);
+  const y1 = Math.floor(h * 0.95);
 
-  for (const t of sorted) {
-    const ty = (t.bbox.y0 + t.bbox.y1) / 2;
-    let placed = false;
-    for (const row of rows) {
-      const ry = (row[0].bbox.y0 + row[0].bbox.y1) / 2;
-      if (Math.abs(ty - ry) <= yTol) {
-        row.push(t);
-        placed = true;
-        break;
-      }
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+
+  const xScore = new Array<number>(w).fill(0);
+  const yScore = new Array<number>(h).fill(0);
+
+  // muestreo más liviano
+  const xStep = 2;
+  const yStep = 3;
+
+  // Score por columna (densidad de oscuro)
+  for (let x = 0; x < w; x += xStep) {
+    let s = 0;
+    for (let y = y0; y < y1; y += yStep) {
+      const idx = (y * w + x) * 4;
+      const l = getLumaAt(d, idx);
+      if (l < 175) s++; // "oscuro"
     }
-    if (!placed) rows.push([t]);
+    xScore[x] = s;
   }
 
-  const merged: OcrToken[] = [];
-  for (const row of rows) {
-    row.sort((a, b) => a.bbox.x0 - b.bbox.x0);
-
-    let cur: OcrToken | null = null;
-    for (const t of row) {
-      if (!cur) {
-        cur = { ...t };
-        continue;
-      }
-
-      const gap = t.bbox.x0 - cur.bbox.x1;
-      const sameLine = Math.abs(((t.bbox.y0 + t.bbox.y1) / 2) - ((cur.bbox.y0 + cur.bbox.y1) / 2)) <= yTol;
-
-      // Merge if very close (digits from same number)
-      const gapTol = 14; // px
-      if (sameLine && gap >= -2 && gap <= gapTol && (cur.text.length + t.text.length) <= 4) {
-        cur = {
-          text: `${cur.text}${t.text}`,
-          conf: (cur.conf + t.conf) / 2,
-          bbox: {
-            x0: Math.min(cur.bbox.x0, t.bbox.x0),
-            y0: Math.min(cur.bbox.y0, t.bbox.y0),
-            x1: Math.max(cur.bbox.x1, t.bbox.x1),
-            y1: Math.max(cur.bbox.y1, t.bbox.y1),
-          },
-        };
-      } else {
-        merged.push(cur);
-        cur = { ...t };
-      }
+  // Score por fila (densidad de oscuro)
+  const xA = Math.floor(w * 0.05);
+  const xB = Math.floor(w * 0.95);
+  for (let y = 0; y < h; y += yStep) {
+    let s = 0;
+    for (let x = xA; x < xB; x += xStep) {
+      const idx = (y * w + x) * 4;
+      const l = getLumaAt(d, idx);
+      if (l < 175) s++;
     }
-    if (cur) merged.push(cur);
+    yScore[y] = s;
   }
 
-  // Convert to values + filter length 2..4
-  const out = merged
-    .filter((t) => t.text.length >= 2 && t.text.length <= 4)
-    .map((t) => ({ ...t, value: parseInt(t.text, 10) }));
+  const xMax = Math.max(...xScore);
+  const yMax = Math.max(...yScore);
 
-  return out;
+  // thresholds adaptativos
+  const xTh = Math.max(6, xMax * 0.30);
+  const yTh = Math.max(10, yMax * 0.30);
+
+  let xmin = 0;
+  while (xmin < w && xScore[xmin] < xTh) xmin++;
+  let xmax = w - 1;
+  while (xmax >= 0 && xScore[xmax] < xTh) xmax--;
+
+  let ymin = 0;
+  while (ymin < h && yScore[ymin] < yTh) ymin++;
+  let ymax = h - 1;
+  while (ymax >= 0 && yScore[ymax] < yTh) ymax--;
+
+  // Si falló (no encontró nada coherente), devuelve todo
+  if (xmin >= xmax || ymin >= ymax) {
+    return { x: 0, y: 0, w, h };
+  }
+
+  // padding (para no cortar barras/labels)
+  const padX = Math.round((xmax - xmin) * 0.04);
+  const padY = Math.round((ymax - ymin) * 0.06);
+
+  xmin = clamp(xmin - padX, 0, w - 1);
+  xmax = clamp(xmax + padX, 0, w - 1);
+  ymin = clamp(ymin - padY, 0, h - 1);
+  ymax = clamp(ymax + padY, 0, h - 1);
+
+  return { x: xmin, y: ymin, w: xmax - xmin + 1, h: ymax - ymin + 1 };
 }
 
-function dedupeByX(tokens: OcrToken[]) {
-  // Dedupe by x-center buckets (keep highest confidence)
-  const buckets: Record<string, OcrToken> = {};
-  for (const t of tokens) {
-    const xc = (t.bbox.x0 + t.bbox.x1) / 2;
-    const key = String(Math.round(xc / 18)); // bucket size
-    const existing = buckets[key];
-    if (!existing || t.conf > existing.conf) buckets[key] = t;
+/**
+ * Recorte rough: asume página completa. Si la imagen ya es "solo gráfica", igual funciona.
+ */
+function roughCropForLumaPage(full: HTMLCanvasElement) {
+  const w = full.width;
+  const h = full.height;
+
+  // Si es landscape (posible screenshot ya recortado), usa casi todo
+  const landscape = w > h * 1.1;
+  if (landscape) {
+    return cropCanvas(full, Math.round(w * 0.02), Math.round(h * 0.05), Math.round(w * 0.96), Math.round(h * 0.90));
   }
-  return Object.values(buckets).sort((a, b) => (a.bbox.x0 + a.bbox.x1) / 2 - (b.bbox.x0 + b.bbox.x1) / 2);
+
+  // Portrait (foto de página completa): la gráfica suele estar en la mitad inferior
+  return cropCanvas(full, Math.round(w * 0.03), Math.round(h * 0.38), Math.round(w * 0.94), Math.round(h * 0.48));
 }
 
-async function runTesseractOnCanvas(canvas: HTMLCanvasElement) {
+/**
+ * Encuentra el "top" de la barra en un segmento vertical (para cortar justo arriba y leer solo el label).
+ */
+function findBarTopY(
+  ctx: CanvasRenderingContext2D,
+  segX0: number,
+  segX1: number,
+  yTop: number,
+  yBottom: number
+): number | null {
+  const w = ctx.canvas.width;
+  const h = ctx.canvas.height;
+  const x0 = clamp(Math.floor(segX0), 0, w - 1);
+  const x1 = clamp(Math.floor(segX1), 0, w - 1);
+  const yt = clamp(Math.floor(yTop), 0, h - 1);
+  const yb = clamp(Math.floor(yBottom), 0, h - 1);
+
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+
+  // muestrea 9 puntos en X dentro del segmento
+  const samples = 9;
+  const xs: number[] = [];
+  for (let i = 0; i < samples; i++) {
+    const x = Math.round(x0 + (i / (samples - 1)) * (x1 - x0));
+    xs.push(x);
+  }
+
+  // sube desde abajo hasta encontrar "muchos oscuros" (barra)
+  for (let y = yb; y >= yt; y -= 1) {
+    let dark = 0;
+    for (const x of xs) {
+      const idx = (y * w + x) * 4;
+      const l = getLumaAt(d, idx);
+      if (l < 165) dark++;
+    }
+    if (dark >= Math.ceil(samples * 0.45)) {
+      // primera fila donde se ve la barra -> top aproximado
+      // sigue subiendo un poquito para encontrar el borde superior real
+      let y2 = y;
+      for (let k = 0; k < 8 && y2 > yt; k++) {
+        const yTry = y2 - 1;
+        let dark2 = 0;
+        for (const x of xs) {
+          const idx = (yTry * w + x) * 4;
+          const l = getLumaAt(d, idx);
+          if (l < 165) dark2++;
+        }
+        if (dark2 >= Math.ceil(samples * 0.45)) y2 = yTry;
+        else break;
+      }
+      return y2;
+    }
+  }
+  return null;
+}
+
+/**
+ * Construye ROIs encima de cada barra (13 columnas), y OCR por ROI.
+ * Devuelve números en orden izq->der.
+ */
+async function ocrLumaBarLabels(plotCanvas: HTMLCanvasElement): Promise<{ values: number[]; confidences: number[]; roiStrip?: string }> {
+  // Tesseract worker (dinámico para evitar líos SSR/turbopack)
+  const worker = await getTesseractWorker();
+
+  const ctx = plotCanvas.getContext("2d");
+  if (!ctx) throw new Error("No canvas context");
+
+  const w = plotCanvas.width;
+  const h = plotCanvas.height;
+
+  // Área vertical donde están barras (evita header y eje inferior)
+  const barsTop = Math.round(h * 0.18);
+  const barsBottom = Math.round(h * 0.90);
+
+  const barCount = 13; // LUMA usualmente 13 meses
+  const padX = Math.round(w * 0.02);
+
+  const rois: HTMLCanvasElement[] = [];
+  const values: number[] = [];
+  const confs: number[] = [];
+
+  for (let i = 0; i < barCount; i++) {
+    // segmento por barra (uniforme). Funciona bien con gráficas estándar de LUMA.
+    const segX0 = padX + (i / barCount) * (w - 2 * padX);
+    const segX1 = padX + ((i + 1) / barCount) * (w - 2 * padX);
+
+    const topY = findBarTopY(ctx, segX0, segX1, barsTop, barsBottom);
+    if (topY == null) continue;
+
+    const labelH = Math.max(28, Math.round(h * 0.12));
+    const roiY = clamp(topY - labelH - 2, 0, h - 1);
+    const roiH = clamp(labelH, 10, h);
+
+    const roiX = clamp(segX0 + (segX1 - segX0) * 0.10, 0, w - 1);
+    const roiW = clamp((segX1 - segX0) * 0.80, 10, w);
+
+    let roi = cropCanvas(plotCanvas, roiX, roiY, roiW, roiH);
+
+    // Preprocess: agranda + binariza
+    roi = scaleCanvas(roi, 2);
+    binarizeInPlace(roi);
+
+    rois.push(roi);
+
+    const res = await worker.recognize(roi);
+    const text = (res?.data?.text ?? "").trim();
+
+    // Extract solo dígitos (kWh)
+    // (tesseract a veces mete espacios o cosas raras)
+    const m = text.replace(/[^\d]/g, " ").match(/\d{2,4}/);
+    if (!m) continue;
+
+    const n = parseInt(m[0], 10);
+    // filtro 20–3000 (según tu regla)
+    if (isFinite(n) && n >= 20 && n <= 3000) {
+      values.push(n);
+      const c = typeof res?.data?.confidence === "number" ? res.data.confidence : 0;
+      confs.push(c);
+    }
+  }
+
+  // Debug strip (ROIs concatenadas) para ver qué está leyendo el OCR
+  let roiStrip: string | undefined;
+  if (rois.length > 0) {
+    const strip = document.createElement("canvas");
+    const gap = 6;
+    const roiH = Math.max(...rois.map((c) => c.height));
+    const roiWsum = rois.reduce((s, c) => s + c.width, 0) + gap * (rois.length - 1);
+    strip.width = Math.min(2200, roiWsum); // evita mega-dataurl
+    strip.height = roiH;
+
+    const sctx = strip.getContext("2d");
+    if (sctx) {
+      sctx.fillStyle = "#ffffff";
+      sctx.fillRect(0, 0, strip.width, strip.height);
+
+      let x = 0;
+      for (const r of rois) {
+        if (x + r.width > strip.width) break;
+        sctx.drawImage(r, x, 0);
+        x += r.width + gap;
+      }
+      roiStrip = strip.toDataURL("image/jpeg", 0.9);
+    }
+  }
+
+  return { values, confidences: confs, roiStrip };
+}
+
+/**
+ * Worker Tesseract robusto (arregla el error tipo "loadLanguage is not a function")
+ */
+async function getTesseractWorker(): Promise<any> {
+  const g = globalThis as any;
+  if (g.__LUMA_TESS_WORKER) return g.__LUMA_TESS_WORKER;
+
   const mod: any = await import("tesseract.js");
-  const T = mod?.default ?? mod;
+  const createWorker =
+    mod.createWorker ?? mod.default?.createWorker ?? mod.default;
 
-  const recognize = T?.recognize ?? mod?.recognize;
-  if (typeof recognize !== "function") {
-    throw new Error("Tesseract no está disponible. Verifica que instalaste: npm i tesseract.js");
+  if (!createWorker) {
+    throw new Error("tesseract.js: no se encontró createWorker");
   }
 
-  const result = await recognize(canvas, "eng", {
-    logger: () => {},
-    tessedit_char_whitelist: "0123456789",
-    preserve_interword_spaces: "1",
-    user_defined_dpi: "300",
-  });
-
-  const data = result?.data ?? {};
-  const words = (data.words ?? []) as any[];
-
-  const tokens: OcrToken[] = words
-    .filter((w) => typeof w.text === "string" && w.text.trim().length > 0)
-    .map((w) => ({
-      text: w.text.trim(),
-      conf: typeof w.confidence === "number" ? w.confidence : 0,
-      bbox: {
-        x0: w.bbox?.x0 ?? 0,
-        y0: w.bbox?.y0 ?? 0,
-        x1: w.bbox?.x1 ?? 0,
-        y1: w.bbox?.y1 ?? 0,
-      },
-    }));
-
-  return { tokens, rawText: String(data.text ?? "") };
-}
-
-async function extractMonthlyKwhFromLumaPage(rawCanvas: HTMLCanvasElement): Promise<OcrSummary> {
+  let worker: any;
   try {
-    const W = rawCanvas.width;
-    const H = rawCanvas.height;
-
-    // 1) Find chart title band Y (gray bar area)
-    const yBand = findChartTitleBandY(rawCanvas);
-
-    // 2) Crop a region around chart area (from slightly above the gray bar down)
-    const topPad = Math.round(H * 0.01);
-    const y1 = clamp(yBand - topPad, Math.round(H * 0.35), Math.round(H * 0.80));
-    const y2 = Math.round(H * 0.95);
-    const chartRegion = cropCanvas(rawCanvas, 0, y1, W, y2 - y1);
-
-    // 3) Remove left area until after the Y axis line
-    const axisX = findYAxisX(chartRegion);
-    const leftCut = clamp(axisX + 12, 0, Math.round(chartRegion.width * 0.25));
-    const chartNoAxis = cropCanvas(chartRegion, leftCut, 0, chartRegion.width - leftCut, chartRegion.height);
-
-    // 4) Focus OCR only on the TOP portion where bar labels sit (avoid bottom line-chart area)
-    const labelsHeight = Math.round(chartNoAxis.height * 0.62);
-    const labelsRegion = cropCanvas(chartNoAxis, 0, 0, chartNoAxis.width, labelsHeight);
-
-    // 5) Enhance + OCR
-    const enhanced = enhanceForOcr(labelsRegion, 2);
-    const { tokens } = await runTesseractOnCanvas(enhanced);
-
-    // Merge split digits and dedupe by x position
-    const merged = mergeAdjacentDigitTokens(tokens);
-    const deduped = dedupeByX(merged);
-
-    // Position-based filtering (discard anything too far left = residual axis numbers, if any)
-    const cropW = enhanced.width;
-    const cropH = enhanced.height;
-
-    const candidates = deduped
-      .filter((t) => typeof t.value === "number" && isFinite(t.value!))
-      .filter((t) => {
-        const v = t.value!;
-        if (v < OCR_MIN_KWH || v > OCR_MAX_KWH) return false;
-
-        const x0 = t.bbox.x0;
-        const y0 = t.bbox.y0;
-
-        // discard far-left (axis) and very bottom/top noise
-        if (x0 < cropW * 0.06) return false;
-        if (y0 < cropH * 0.02) return false;
-        if (y0 > cropH * 0.92) return false;
-
-        return true;
-      });
-
-    const detectedValues = candidates.map((c) => c.value!) as number[];
-
-    // Sort by x-center left->right
-    const byX = candidates
-      .slice()
-      .sort((a, b) => ((a.bbox.x0 + a.bbox.x1) / 2) - ((b.bbox.x0 + b.bbox.x1) / 2));
-
-    // Take up to 13 bars max, then use 12 most recent (right-most)
-    const valuesOrdered = byX.map((t) => t.value!) as number[];
-
-    // Remove obvious duplicates (sometimes OCR repeats same label)
-    const uniqueOrdered: number[] = [];
-    for (const v of valuesOrdered) {
-      if (uniqueOrdered.length === 0) uniqueOrdered.push(v);
-      else {
-        const last = uniqueOrdered[uniqueOrdered.length - 1];
-        if (Math.abs(last - v) <= 1) continue; // near-duplicate
-        uniqueOrdered.push(v);
-      }
-    }
-
-    const valuesForCalc = uniqueOrdered.length > 12 ? uniqueOrdered.slice(-12) : uniqueOrdered;
-
-    if (valuesForCalc.length < MIN_MONTHS_FOR_OCR) {
-      return {
-        ok: false,
-        message: `OCR insuficiente: se detectaron menos de ${MIN_MONTHS_FOR_OCR} meses. Toma la foto más nítida y completa (página 4), o escribe el kWh mensual promedio.`,
-        monthsUsed: valuesForCalc.length,
-        valuesUsed: valuesForCalc,
-        valuesDetected: uniqueOrdered,
-        avgMonthly: null,
-        annualKWh: null,
-        avgConfidence: null,
-        rawDataUrl: canvasToDataUrl(rawCanvas),
-        chartCropDataUrl: canvasToDataUrl(chartNoAxis),
-        labelsCropDataUrl: canvasToDataUrl(enhanced),
-      };
-    }
-
-    const avgMonthly = valuesForCalc.reduce((a, b) => a + b, 0) / valuesForCalc.length;
-    const annualKWh =
-      valuesForCalc.length >= 12
-        ? valuesForCalc.reduce((a, b) => a + b, 0)
-        : avgMonthly * 12;
-
-    const confAvg =
-      candidates.length > 0 ? candidates.reduce((a, t) => a + t.conf, 0) / candidates.length : null;
-
-    return {
-      ok: true,
-      message: undefined,
-      monthsUsed: valuesForCalc.length,
-      valuesUsed: valuesForCalc,
-      valuesDetected: uniqueOrdered,
-      avgMonthly: round2(avgMonthly),
-      annualKWh: Math.round(annualKWh),
-      avgConfidence: confAvg !== null ? round2(confAvg) : null,
-      rawDataUrl: canvasToDataUrl(rawCanvas),
-      chartCropDataUrl: canvasToDataUrl(chartNoAxis),
-      labelsCropDataUrl: canvasToDataUrl(enhanced),
-    };
-  } catch (e: any) {
-    return {
-      ok: false,
-      message: e?.message ?? "Error corriendo OCR.",
-      monthsUsed: 0,
-      valuesUsed: [],
-      valuesDetected: [],
-      avgMonthly: null,
-      annualKWh: null,
-      avgConfidence: null,
-    };
+    worker = await createWorker({
+      logger: () => {},
+    });
+  } catch {
+    // fallback por si la firma es distinta
+    worker = await createWorker("eng", 1, {
+      logger: () => {},
+    });
   }
-}
 
-function recommendBatteryKwh(criticalKw: number, hours: number) {
-  const requiredUsable = criticalKw * hours; // kWh
-  const requiredNominal = requiredUsable / BATTERY_USABLE_FACTOR;
-  const pick = BATTERY_OPTIONS_KWH.find((k) => k >= requiredNominal) ?? BATTERY_OPTIONS_KWH[BATTERY_OPTIONS_KWH.length - 1];
-  return { requiredNominal: round2(requiredNominal), pick };
+  // init compatible con varias versiones
+  if (worker.load) await worker.load();
+  if (worker.loadLanguage) await worker.loadLanguage("eng");
+  if (worker.initialize) await worker.initialize("eng");
+  if (worker.setParameters) {
+    await worker.setParameters({
+      tessedit_char_whitelist: "0123456789",
+      tessedit_pageseg_mode: "7", // SINGLE_LINE
+    });
+  }
+
+  g.__LUMA_TESS_WORKER = worker;
+  return worker;
 }
 
 export default function Page() {
-  // Upload refs
+  // Inputs del modelo
+  const [offsetPct, setOffsetPct] = useState(90);
+  const [psh, setPsh] = useState(5);
+  const [lossFactor, setLossFactor] = useState(0.8);
+  const [panelW, setPanelW] = useState(450);
+
+  const [roofType, setRoofType] = useState<"Shingle" | "Metal" | "Concrete">("Shingle");
+  const [permits, setPermits] = useState(1200);
+  const [interconnection, setInterconnection] = useState(450);
+  const [installedPricePerW, setInstalledPricePerW] = useState(2.3);
+
+  // Battery
+  const SOLUNA_PRICE_PER_KWH = 350;
+  const BATTERY_USABLE_FACTOR = 0.9;
+
+  const [backupHours, setBackupHours] = useState(8);
+  const [criticalKw, setCriticalKw] = useState(1.5);
+
+  // Consumo (manual u OCR)
+  const [monthlyKwhInput, setMonthlyKwhInput] = useState<string>("");
+
+  // Imagen + previews
+  const [rawPreview, setRawPreview] = useState<string>("");
+  const [plotPreview, setPlotPreview] = useState<string>("");
+  const [roiPreview, setRoiPreview] = useState<string>("");
+
+  const [ocr, setOcr] = useState<OcrSummary>({ detectedAll: [], used12MostRecent: [], monthsUsed: 0, annualKwh: 0, avgMonthlyKwh: 0, confidencePct: 0, status: "idle" });
+  const [busy, setBusy] = useState(false);
+
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
 
-  // OCR state
-  const [ocr, setOcr] = useState<OcrSummary>({
-    ok: false,
-    monthsUsed: 0,
-    valuesUsed: [],
-    valuesDetected: [],
-    avgMonthly: null,
-    annualKWh: null,
-    avgConfidence: null,
-  });
-  const [ocrBusy, setOcrBusy] = useState(false);
+  const roofAdderPerW = useMemo(() => {
+    // Ajusta estos adders a tu realidad si quieres
+    if (roofType === "Metal") return 0.08;
+    if (roofType === "Concrete") return 0.18;
+    return 0.0;
+  }, [roofType]);
 
-  // Manual override (monthly average)
-  const [manualMonthly, setManualMonthly] = useState<string>("");
+  const monthlyKwh = useMemo(() => {
+    const n = parseFloat(monthlyKwhInput);
+    return isFinite(n) ? n : 0;
+  }, [monthlyKwhInput]);
 
-  // System assumptions
-  const [offsetPct, setOffsetPct] = useState<number>(90);
-  const [psh, setPsh] = useState<number>(5);
-  const [lossFactor, setLossFactor] = useState<number>(0.8);
-  const [panelW, setPanelW] = useState<number>(450);
-  const [roofType, setRoofType] = useState<string>("Shingle");
-  const [permits, setPermits] = useState<number>(1200);
-  const [interconnection, setInterconnection] = useState<number>(450);
-  const [installedPricePerW, setInstalledPricePerW] = useState<number>(PV_PRICE_PER_W);
-
-  // Battery assumptions
-  const [batteryMode, setBatteryMode] = useState<"recommended" | "none" | "custom">("recommended");
-  const [backupHours, setBackupHours] = useState<number>(8);
-  const [criticalKw, setCriticalKw] = useState<number>(1.5);
-  const [customBatteryKwh, setCustomBatteryKwh] = useState<number>(16);
-
-  async function handleFile(file: File) {
-    setOcrBusy(true);
-    try {
-      const img = await fileToImage(file);
-      const rawCanvas = drawImageToCanvas(img, 1800);
-      const res = await extractMonthlyKwhFromLumaPage(rawCanvas);
-      setOcr(res);
-    } finally {
-      setOcrBusy(false);
-    }
-  }
-
-  function onPickCamera() {
-    cameraInputRef.current?.click();
-  }
-
-  function onPickGallery() {
-    galleryInputRef.current?.click();
-  }
-
-  const effectiveMonthlyKwh = useMemo(() => {
-    const m = parseFloat(manualMonthly);
-    if (isFinite(m) && m > 0) return m;
-    if (ocr.avgMonthly !== null) return ocr.avgMonthly;
-    return 0;
-  }, [manualMonthly, ocr.avgMonthly]);
+  const annualKwh = useMemo(() => monthlyKwh * 12, [monthlyKwh]);
 
   const pvSizing = useMemo(() => {
-    const monthly = effectiveMonthlyKwh;
-    if (!monthly || monthly <= 0) {
-      return {
-        monthly,
-        daily: 0,
-        pvKw: 0,
-        pvW: 0,
-        panels: 0,
-        pvCost: 0,
-        roofAdder: ROOF_ADDER[roofType] ?? 0,
-        misc: 0,
-        baseTotal: 0,
-      };
+    const eff = Math.max(0.1, lossFactor);
+    const sun = Math.max(0.1, psh);
+    const offset = clamp(offsetPct, 0, 100) / 100;
+
+    const targetAnnual = annualKwh * offset;
+    const kwhPerKwYear = sun * 365 * eff;
+    const kwNeeded = kwhPerKwYear > 0 ? targetAnnual / kwhPerKwYear : 0;
+
+    const panels = panelW > 0 ? Math.max(0, Math.ceil((kwNeeded * 1000) / panelW)) : 0;
+    const systemKw = panels * panelW / 1000;
+
+    const basePvCost = systemKw * 1000 * installedPricePerW;
+    const roofAdderCost = systemKw * 1000 * roofAdderPerW;
+    const sub = basePvCost + roofAdderCost + permits + interconnection;
+    const misc = sub * 0.03;
+    const totalPv = sub + misc;
+
+    return { targetAnnual, kwNeeded, panels, systemKw, basePvCost, roofAdderCost, misc, totalPv };
+  }, [annualKwh, offsetPct, psh, lossFactor, panelW, installedPricePerW, roofAdderPerW, permits, interconnection]);
+
+  const batterySizing = useMemo(() => {
+    const req = (criticalKw * backupHours) / Math.max(0.1, BATTERY_USABLE_FACTOR);
+    const options = [10, 16, 20, 32, 40, 48, 60, 80, 100];
+    const pick = options.find((x) => x >= req) ?? options[options.length - 1];
+    const cost = pick * SOLUNA_PRICE_PER_KWH;
+    return { requiredKwh: req, recommendedKwh: pick, batteryCost: cost };
+  }, [criticalKw, backupHours]);
+
+  const totalWithBattery = useMemo(() => pvSizing.totalPv + batterySizing.batteryCost, [pvSizing.totalPv, batterySizing.batteryCost]);
+
+  async function processFile(file: File) {
+    setBusy(true);
+    setOcr({ detectedAll: [], used12MostRecent: [], monthsUsed: 0, annualKwh: 0, avgMonthlyKwh: 0, confidencePct: 0, status: "working" });
+
+    try {
+      const bmp = await fileToBitmap(file);
+      const full = canvasFromBitmap(bmp, 1600);
+
+      setRawPreview(full.toDataURL("image/jpeg", 0.9));
+
+      // 1) rough crop
+      const rough = roughCropForLumaPage(full);
+
+      // 2) find plot bounds inside rough
+      const b = findPlotBounds(rough);
+      const plot = cropCanvas(rough, b.x, b.y, b.w, b.h);
+      setPlotPreview(plot.toDataURL("image/jpeg", 0.9));
+
+      // 3) OCR bar labels only
+      const { values, confidences, roiStrip } = await ocrLumaBarLabels(plot);
+      if (roiStrip) setRoiPreview(roiStrip);
+
+      // values ya vienen filtrados 20–3000 y en orden izq->der (según ROIs válidos)
+      // si se “perdió” alguno, igual usamos los que haya (mínimo 4)
+      const detectedAll = values.slice();
+
+      // usa 12 más recientes (derecha)
+      const used = detectedAll.length > 12 ? detectedAll.slice(detectedAll.length - 12) : detectedAll.slice();
+      const monthsUsed = used.length;
+
+      if (monthsUsed < 4) {
+        setOcr({
+          detectedAll,
+          used12MostRecent: used,
+          monthsUsed,
+          annualKwh: 0,
+          avgMonthlyKwh: 0,
+          confidencePct: 0,
+          status: "insufficient",
+          message: "OCR insuficiente: se detectaron menos de 4 meses. Toma la foto más nítida y completa (página 4), o escribe el kWh mensual promedio.",
+        });
+        return;
+      }
+
+      const sum = used.reduce((a, b) => a + b, 0);
+      const avg = sum / monthsUsed;
+      const annual = monthsUsed >= 12 ? sum : avg * 12;
+
+      const conf = confidences.length ? confidences.reduce((a, b) => a + b, 0) / confidences.length : 0;
+
+      setOcr({
+        detectedAll,
+        used12MostRecent: used,
+        monthsUsed: Math.min(12, monthsUsed),
+        annualKwh: annual,
+        avgMonthlyKwh: annual / 12,
+        confidencePct: clamp(conf, 0, 100),
+        status: "ok",
+        message: monthsUsed >= 12 ? "OK. Anual (12m real) y promedio mensual calculados desde la gráfica." : "OK. Anual estimado usando los meses disponibles (>=4).",
+      });
+
+      // llena el input mensual con el promedio calculado
+      setMonthlyKwhInput(formatNumber(annual / 12, 2));
+    } catch (e: any) {
+      setOcr({
+        detectedAll: [],
+        used12MostRecent: [],
+        monthsUsed: 0,
+        annualKwh: 0,
+        avgMonthlyKwh: 0,
+        confidencePct: 0,
+        status: "error",
+        message: e?.message ? String(e.message) : "Error OCR",
+      });
+    } finally {
+      setBusy(false);
     }
+  }
 
-    const daily = monthly / DAYS_PER_MONTH;
-    const offset = clamp(offsetPct / 100, 0.1, 1.0);
-    const pvKw = (daily * offset) / Math.max(0.1, psh * lossFactor);
-    const pvW = pvKw * 1000;
-    const panels = Math.ceil(pvW / Math.max(1, panelW));
+  function onPickFile(file?: File | null) {
+    if (!file) return;
+    void processFile(file);
+  }
 
-    const basePv = pvW * installedPricePerW;
-    const roofAdder = ROOF_ADDER[roofType] ?? 0;
-    const subtotal = basePv + roofAdder + permits + interconnection;
-    const misc = subtotal * 0.03;
-    const baseTotal = subtotal + misc;
+  function clearAll() {
+    setRawPreview("");
+    setPlotPreview("");
+    setRoiPreview("");
+    setMonthlyKwhInput("");
+    setOcr({ detectedAll: [], used12MostRecent: [], monthsUsed: 0, annualKwh: 0, avgMonthlyKwh: 0, confidencePct: 0, status: "idle" });
+  }
 
-    return {
-      monthly,
-      daily: round2(daily),
-      pvKw: round2(pvKw),
-      pvW: Math.round(pvW),
-      panels,
-      pvCost: basePv,
-      roofAdder,
-      misc,
-      baseTotal,
-    };
-  }, [effectiveMonthlyKwh, offsetPct, psh, lossFactor, panelW, roofType, permits, interconnection, installedPricePerW]);
+  const commercialLikely = useMemo(() => {
+    if (!monthlyKwh || !isFinite(monthlyKwh)) return false;
+    return monthlyKwh > 3000;
+  }, [monthlyKwh]);
 
-  const battery = useMemo(() => {
-    if (batteryMode === "none") {
-      return { kwh: 0, cost: 0, requiredNominal: 0, note: "Sin batería" };
-    }
-    if (batteryMode === "custom") {
-      const kwh = clamp(customBatteryKwh, 0, 500);
-      const cost = kwh * SOLUNA_PRICE_PER_KWH;
-      return { kwh, cost, requiredNominal: 0, note: "Batería (custom)" };
-    }
-    const rec = recommendBatteryKwh(criticalKw, backupHours);
-    const kwh = rec.pick;
-    const cost = kwh * SOLUNA_PRICE_PER_KWH;
-    return { kwh, cost, requiredNominal: rec.requiredNominal, note: "Recomendada (según respaldo)" };
-  }, [batteryMode, customBatteryKwh, criticalKw, backupHours]);
-
-  const totals = useMemo(() => {
-    const pvOnly = pvSizing.baseTotal;
-    const withBattery = pvSizing.baseTotal + battery.cost;
-    return { pvOnly, withBattery };
-  }, [pvSizing.baseTotal, battery.cost]);
-
-  const commercialFlag = useMemo(() => {
-    // If avg monthly > 3000, likely commercial per your rule
-    if (effectiveMonthlyKwh > OCR_MAX_KWH) return true;
-    return false;
-  }, [effectiveMonthlyKwh]);
+  useEffect(() => {
+    // si el usuario escribe manualmente, no tocamos nada más
+  }, [monthlyKwhInput]);
 
   return (
-    <div className="min-h-screen bg-white text-zinc-900">
+    <main className="min-h-screen bg-white text-slate-900">
       <div className="mx-auto max-w-5xl px-4 py-6">
-        <div className="flex flex-col gap-2">
-          <div className="text-2xl font-semibold">Sunsol · Cotizador (sin vendedor)</div>
-          <div className="text-sm text-zinc-500">
-            PV: ${PV_PRICE_PER_W.toFixed(2)}/W · Batería Soluna: ${SOLUNA_PRICE_PER_KWH}/kWh · Sin incentivos
-          </div>
-          <div className="text-xs text-zinc-500">
-            Estimado preliminar. Validación final requiere inspección.
-          </div>
+        <div className="flex flex-col gap-1">
+          <h1 className="text-2xl font-semibold">Sunsol · Cotizador (sin vendedor)</h1>
+          <p className="text-sm text-slate-600">
+            PV: ${installedPricePerW.toFixed(2)}/W · Batería Soluna: ${SOLUNA_PRICE_PER_KWH}/kWh · Sin incentivos
+          </p>
+          <p className="text-xs text-slate-500">Estimado preliminar. Validación final requiere inspección.</p>
         </div>
 
-        <div className="mt-6 grid gap-4 md:grid-cols-2">
-          {/* Uploader */}
-          <div className="rounded-2xl border border-zinc-200 p-4 shadow-sm">
-            <div className="text-base font-semibold">Foto / Screenshot de LUMA (página 4)</div>
-            <div className="mt-1 text-sm text-zinc-600">
-              Usa la página 4 donde aparece “CONSUMPTION HISTORY (KWH)” (o “Historial de consumo”).
-              Toma la <b>página completa</b>, nítida y sin reflejos.
+        <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
+          {/* Uploader + Consumo */}
+          <section className="rounded-2xl border border-slate-200 p-4 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-base font-semibold">Foto / Screenshot de LUMA (página 4)</h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  Usa la página 4 donde aparece <span className="font-medium">“CONSUMPTION HISTORY (KWH)”</span> (o “Historial de consumo”).
+                  Toma la <span className="font-medium">página completa</span>, nítida y sin reflejos.
+                </p>
+              </div>
             </div>
 
-            <div className="mt-3 flex flex-col gap-2">
+            {/* Inputs escondidos */}
+            <input
+              ref={cameraInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              onChange={(e) => onPickFile(e.target.files?.[0])}
+            />
+            <input
+              ref={galleryInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => onPickFile(e.target.files?.[0])}
+            />
+
+            <div className="mt-4 flex flex-col gap-3 sm:flex-row">
               <button
                 type="button"
-                onClick={onPickCamera}
-                className="rounded-xl bg-black px-4 py-3 text-white shadow-sm active:scale-[0.99]"
+                onClick={() => cameraInputRef.current?.click()}
+                className="w-full rounded-xl bg-black px-4 py-3 text-white shadow-sm disabled:opacity-60"
+                disabled={busy}
               >
                 📷 Tomar foto
               </button>
 
               <button
                 type="button"
-                onClick={onPickGallery}
-                className="rounded-xl border border-zinc-300 bg-white px-4 py-3 text-zinc-900 shadow-sm active:scale-[0.99]"
+                onClick={() => galleryInputRef.current?.click()}
+                className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3 text-slate-900 shadow-sm disabled:opacity-60"
+                disabled={busy}
               >
                 🖼️ Subir de galería
               </button>
-
-              <input
-                ref={cameraInputRef}
-                type="file"
-                accept="image/*"
-                capture="environment"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) void handleFile(f);
-                  e.currentTarget.value = "";
-                }}
-              />
-
-              <input
-                ref={galleryInputRef}
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) void handleFile(f);
-                  e.currentTarget.value = "";
-                }}
-              />
             </div>
 
-            <div className="mt-4">
-              <div className="text-sm font-medium text-zinc-800">Consumo mensual promedio (kWh/mes)</div>
+            <div className="mt-4 rounded-2xl border border-slate-200 p-4">
+              <label className="text-sm font-medium">Consumo mensual promedio (kWh/mes)</label>
               <input
-                value={manualMonthly}
-                onChange={(e) => setManualMonthly(e.target.value)}
-                inputMode="decimal"
+                value={monthlyKwhInput}
+                onChange={(e) => setMonthlyKwhInput(e.target.value)}
                 placeholder="Ej. 600"
-                className="mt-2 w-full rounded-xl border border-zinc-200 px-3 py-3 text-base outline-none focus:border-zinc-400"
+                inputMode="decimal"
+                className="mt-2 w-full rounded-xl border border-slate-300 px-3 py-3 text-base outline-none focus:border-slate-500"
               />
-              <div className="mt-1 text-xs text-zinc-500">
-                Si el OCR falla, escribe el promedio mensual aquí.
-              </div>
+              <p className="mt-2 text-sm text-slate-500">Si el OCR falla, escribe el promedio mensual aquí.</p>
 
               <div className="mt-3 text-sm">
-                <div>
-                  <span className="font-medium">Consumo anual:</span>{" "}
-                  {ocr.annualKWh ? (
-                    <span>{ocr.annualKWh.toLocaleString()} kWh (usó {ocr.monthsUsed} mes(es))</span>
-                  ) : (
-                    <span>— (sin OCR)</span>
-                  )}
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600">Consumo anual:</span>
+                  <span className="font-semibold">{ocr.status === "ok" ? `${formatNumber(ocr.annualKwh, 0)} kWh` : "— (sin OCR)"}</span>
                 </div>
-                <div className="text-xs text-zinc-500">
-                  OCR confianza: {ocr.avgConfidence !== null ? `${ocr.avgConfidence}%` : "—"}
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600">OCR confianza:</span>
+                  <span className="font-semibold">{ocr.status === "ok" ? `${formatNumber(ocr.confidencePct, 1)}%` : "—"}</span>
                 </div>
-
-                {ocrBusy && (
-                  <div className="mt-3 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm">
-                    Procesando OCR…
-                  </div>
-                )}
-
-                {!ocrBusy && ocr.message && (
-                  <div className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-                    {ocr.message}
-                  </div>
-                )}
-
-                {commercialFlag && (
-                  <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                    ⚠️ Promedio &gt; {OCR_MAX_KWH} kWh/mes: probable caso comercial. Requiere estimado aparte.
-                  </div>
-                )}
               </div>
 
-              <div className="mt-3 flex gap-2">
+              {commercialLikely && (
+                <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+                  ⚠️ Promedio mensual &gt; 3000 kWh. Probable caso comercial: requiere otro estimado de costos.
+                </div>
+              )}
+
+              {(ocr.status === "insufficient" || ocr.status === "error") && (
+                <div className="mt-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                  {ocr.message}
+                </div>
+              )}
+
+              {ocr.status === "working" && (
+                <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+                  Procesando OCR…
+                </div>
+              )}
+
+              {ocr.status === "ok" && (
+                <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                  ✅ {ocr.message}
+                  <div className="mt-2">
+                    <div className="font-medium">
+                      Anual: {formatNumber(ocr.annualKwh, 0)} kWh · Promedio mensual: {formatNumber(ocr.annualKwh / 12, 2)} kWh
+                    </div>
+                    <div className="mt-1 text-xs text-emerald-900/80">
+                      Usó {Math.min(12, ocr.used12MostRecent.length)} mes(es). (Detectados: {ocr.detectedAll.join(", ") || "—"})
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-4 flex gap-2">
                 <button
                   type="button"
                   onClick={() => {
-                    // Re-run OCR if we have last raw image
-                    // (We only stored data URLs; reprocess requires new file. So we just tell user to re-upload.)
-                    alert("Para reprocesar, vuelve a subir/tomar la foto (recomendado: más nítida y completa).");
+                    // reprocesa usando el rawPreview no es posible, necesita el file; por UX dejamos que el usuario vuelva a tomar/subir
+                    // (si quieres reprocesar exacto sin re-subir, habría que guardar el File en state)
+                    // Aquí solo resetea mensajes para que el usuario re-intente.
+                    setOcr((o) => ({ ...o, message: o.message }));
                   }}
-                  className="flex-1 rounded-xl border border-zinc-300 bg-white px-4 py-3 text-sm shadow-sm active:scale-[0.99]"
+                  className="flex-1 rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 shadow-sm"
+                  disabled={busy}
                 >
-                  🔄 Reprocesar OCR
+                  🔁 Reprocesar OCR
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setOcr({
-                      ok: false,
-                      monthsUsed: 0,
-                      valuesUsed: [],
-                      valuesDetected: [],
-                      avgMonthly: null,
-                      annualKWh: null,
-                      avgConfidence: null,
-                    });
-                    setManualMonthly("");
-                  }}
-                  className="rounded-xl border border-zinc-300 bg-white px-4 py-3 text-sm shadow-sm active:scale-[0.99]"
+                  onClick={clearAll}
+                  className="flex-1 rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 shadow-sm"
+                  disabled={busy}
                 >
                   🧹 Limpiar
                 </button>
               </div>
             </div>
 
-            {/* Preview */}
-            {(ocr.rawDataUrl || ocr.chartCropDataUrl || ocr.labelsCropDataUrl) && (
-              <div className="mt-5 rounded-2xl border border-zinc-200 p-3">
-                <div className="text-sm font-semibold">Preview</div>
-                <div className="mt-3 grid gap-3 sm:grid-cols-3">
-                  {ocr.rawDataUrl && (
-                    <div>
-                      <div className="text-xs text-zinc-500">Página (raw)</div>
-                      <img src={ocr.rawDataUrl} alt="raw" className="mt-1 w-full rounded-xl border border-zinc-200" />
-                    </div>
-                  )}
-                  {ocr.chartCropDataUrl && (
-                    <div>
-                      <div className="text-xs text-zinc-500">Auto-crop (zona gráfica)</div>
-                      <img src={ocr.chartCropDataUrl} alt="chart crop" className="mt-1 w-full rounded-xl border border-zinc-200" />
-                    </div>
-                  )}
-                  {ocr.labelsCropDataUrl && (
-                    <div>
-                      <div className="text-xs text-zinc-500">OCR (labels arriba de barras)</div>
-                      <img src={ocr.labelsCropDataUrl} alt="labels crop" className="mt-1 w-full rounded-xl border border-zinc-200" />
-                    </div>
-                  )}
-                </div>
-
-                <div className="mt-3 text-xs text-zinc-600">
-                  Nota: el auto-crop <b>descarta el eje Y por detección de la línea vertical</b> (no importa si los números del eje cambian).
-                  Solo intenta leer los numeritos <b>arriba de las barras</b>.
-                </div>
-
-                <details className="mt-3">
-                  <summary className="cursor-pointer text-sm font-medium text-zinc-800">
-                    ▶ Debug OCR (detectados / usados)
-                  </summary>
-                  <div className="mt-2 text-sm">
-                    <div>
-                      <span className="font-medium">Detectados (orden x):</span>{" "}
-                      {ocr.valuesDetected.length ? ocr.valuesDetected.join(", ") : "—"}
-                    </div>
-                    <div className="mt-1">
-                      <span className="font-medium">Usados (12 más recientes):</span>{" "}
-                      {ocr.valuesUsed.length ? ocr.valuesUsed.join(", ") : "—"}
-                    </div>
+            {/* Previews */}
+            {(rawPreview || plotPreview || roiPreview) && (
+              <div className="mt-4">
+                <h3 className="text-sm font-semibold">Preview</h3>
+                <div className="mt-2 grid grid-cols-2 gap-3">
+                  <div className="rounded-xl border border-slate-200 p-2">
+                    <div className="mb-2 text-xs text-slate-500">Página (raw)</div>
+                    {rawPreview ? <img src={rawPreview} alt="raw" className="w-full rounded-lg" /> : <div className="text-xs text-slate-400">—</div>}
                   </div>
-                </details>
+
+                  <div className="rounded-xl border border-slate-200 p-2">
+                    <div className="mb-2 text-xs text-slate-500">Auto-crop (zona gráfica)</div>
+                    {plotPreview ? <img src={plotPreview} alt="plot" className="w-full rounded-lg" /> : <div className="text-xs text-slate-400">—</div>}
+                  </div>
+                </div>
+
+                <div className="mt-3 rounded-xl border border-slate-200 p-2">
+                  <div className="mb-2 text-xs text-slate-500">Lo que OCR realmente lee (ROIs arriba de barras)</div>
+                  {roiPreview ? <img src={roiPreview} alt="roi" className="w-full rounded-lg" /> : <div className="text-xs text-slate-400">—</div>}
+                  <div className="mt-2 text-xs text-slate-500">
+                    Nota: el auto-crop busca la zona de barras y el OCR solo intenta leer los numeritos arriba de cada barra (no el eje Y).
+                  </div>
+                </div>
               </div>
             )}
-          </div>
+          </section>
 
-          {/* Assumptions / Inputs */}
-          <div className="rounded-2xl border border-zinc-200 p-4 shadow-sm">
-            <div className="text-base font-semibold">Supuestos del sistema</div>
+          {/* Supuestos */}
+          <section className="rounded-2xl border border-slate-200 p-4 shadow-sm">
+            <h2 className="text-base font-semibold">Supuestos del sistema</h2>
 
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div className="mt-4 grid grid-cols-2 gap-3">
               <div>
-                <label className="text-sm font-medium">Offset (%)</label>
+                <label className="text-sm text-slate-700">Offset (%)</label>
                 <input
                   type="number"
                   value={offsetPct}
-                  onChange={(e) => setOffsetPct(clamp(parseFloat(e.target.value || "0"), 10, 100))}
-                  className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
-                />
-              </div>
-              <div>
-                <label className="text-sm font-medium">PSH</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={psh}
-                  onChange={(e) => setPsh(clamp(parseFloat(e.target.value || "0"), 1, 8))}
-                  className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
+                  onChange={(e) => setOffsetPct(parseFloat(e.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
                 />
               </div>
 
               <div>
-                <label className="text-sm font-medium">Pérdidas (factor)</label>
+                <label className="text-sm text-slate-700">PSH</label>
+                <input
+                  type="number"
+                  value={psh}
+                  onChange={(e) => setPsh(parseFloat(e.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                />
+              </div>
+
+              <div>
+                <label className="text-sm text-slate-700">Pérdidas (factor)</label>
                 <input
                   type="number"
                   step="0.01"
                   value={lossFactor}
-                  onChange={(e) => setLossFactor(clamp(parseFloat(e.target.value || "0"), 0.5, 0.95))}
-                  className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
+                  onChange={(e) => setLossFactor(parseFloat(e.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
                 />
               </div>
+
               <div>
-                <label className="text-sm font-medium">Panel (W)</label>
+                <label className="text-sm text-slate-700">Panel (W)</label>
                 <input
                   type="number"
                   value={panelW}
-                  onChange={(e) => setPanelW(clamp(parseFloat(e.target.value || "0"), 300, 700))}
-                  className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
+                  onChange={(e) => setPanelW(parseFloat(e.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
                 />
               </div>
 
               <div>
-                <label className="text-sm font-medium">Techo</label>
+                <label className="text-sm text-slate-700">Techo</label>
                 <select
                   value={roofType}
-                  onChange={(e) => setRoofType(e.target.value)}
-                  className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
+                  onChange={(e) => setRoofType(e.target.value as any)}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
                 >
-                  {Object.keys(ROOF_ADDER).map((k) => (
-                    <option key={k} value={k}>
-                      {k}
-                    </option>
-                  ))}
+                  <option>Shingle</option>
+                  <option>Metal</option>
+                  <option>Concrete</option>
                 </select>
+                <div className="mt-1 text-xs text-slate-500">Adder techo: ${roofAdderPerW.toFixed(2)}/W</div>
               </div>
 
               <div>
-                <label className="text-sm font-medium">Permisos (est.)</label>
+                <label className="text-sm text-slate-700">Permisos (est.)</label>
                 <input
                   type="number"
                   value={permits}
-                  onChange={(e) => setPermits(clamp(parseFloat(e.target.value || "0"), 0, 20000))}
-                  className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
+                  onChange={(e) => setPermits(parseFloat(e.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
                 />
               </div>
 
               <div>
-                <label className="text-sm font-medium">Interconexión (est.)</label>
+                <label className="text-sm text-slate-700">Interconexión (est.)</label>
                 <input
                   type="number"
                   value={interconnection}
-                  onChange={(e) => setInterconnection(clamp(parseFloat(e.target.value || "0"), 0, 20000))}
-                  className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
+                  onChange={(e) => setInterconnection(parseFloat(e.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
                 />
               </div>
 
               <div>
-                <label className="text-sm font-medium">Precio instalado ($/W)</label>
+                <label className="text-sm text-slate-700">Precio instalado ($/W)</label>
                 <input
                   type="number"
                   step="0.01"
                   value={installedPricePerW}
-                  onChange={(e) => setInstalledPricePerW(clamp(parseFloat(e.target.value || "0"), 1.0, 10.0))}
-                  className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
+                  onChange={(e) => setInstalledPricePerW(parseFloat(e.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
                 />
-                <div className="text-xs text-zinc-500 mt-1">Fijo. Sin incentivos.</div>
+                <div className="mt-1 text-xs text-slate-500">Fijo. Sin incentivos.</div>
+              </div>
+            </div>
+          </section>
+
+          {/* Resultado PV */}
+          <section className="rounded-2xl border border-slate-200 p-4 shadow-sm">
+            <h2 className="text-base font-semibold">⚡ Resultado PV</h2>
+
+            <div className="mt-4 grid grid-cols-3 gap-3">
+              <div className="rounded-xl border border-slate-200 p-3">
+                <div className="text-xs text-slate-500">Consumo mensual</div>
+                <div className="mt-1 text-xl font-semibold">{monthlyKwh ? `${formatNumber(monthlyKwh, 0)} kWh` : "—"}</div>
+              </div>
+
+              <div className="rounded-xl border border-slate-200 p-3">
+                <div className="text-xs text-slate-500">Sistema recomendado</div>
+                <div className="mt-1 text-xl font-semibold">{pvSizing.systemKw ? `${formatNumber(pvSizing.systemKw, 2)} kW` : "—"}</div>
+                <div className="mt-1 text-xs text-slate-500">{pvSizing.panels ? `${pvSizing.panels} paneles (est.)` : ""}</div>
+              </div>
+
+              <div className="rounded-xl border border-slate-200 p-3">
+                <div className="text-xs text-slate-500">PV (sin batería)</div>
+                <div className="mt-1 text-xl font-semibold">{formatCurrency(pvSizing.totalPv)}</div>
               </div>
             </div>
 
-            {/* Results */}
-            <div className="mt-5 grid gap-3">
-              <div className="rounded-2xl border border-zinc-200 p-4">
-                <div className="text-sm font-semibold">Resultado PV</div>
-                <div className="mt-3 grid gap-3 sm:grid-cols-3">
-                  <div className="rounded-xl border border-zinc-200 p-3">
-                    <div className="text-xs text-zinc-500">Consumo mensual</div>
-                    <div className="text-xl font-semibold">{effectiveMonthlyKwh ? round2(effectiveMonthlyKwh).toLocaleString() : "0"} kWh</div>
-                  </div>
-                  <div className="rounded-xl border border-zinc-200 p-3">
-                    <div className="text-xs text-zinc-500">Sistema recomendado</div>
-                    <div className="text-xl font-semibold">{pvSizing.pvKw.toLocaleString()} kW</div>
-                    <div className="text-xs text-zinc-500">{pvSizing.panels} paneles (est.)</div>
-                  </div>
-                  <div className="rounded-xl border border-zinc-200 p-3">
-                    <div className="text-xs text-zinc-500">PV (sin batería)</div>
-                    <div className="text-xl font-semibold">{formatMoney(totals.pvOnly)}</div>
-                  </div>
-                </div>
+            <div className="mt-4 rounded-xl border border-slate-200 p-3 text-sm">
+              <div className="flex justify-between"><span className="text-slate-600">Base PV</span><span>{formatCurrency(pvSizing.basePvCost)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-600">Adder techo</span><span>{formatCurrency(pvSizing.roofAdderCost)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-600">Permisos</span><span>{formatCurrency(permits)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-600">Interconexión</span><span>{formatCurrency(interconnection)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-600">Misceláneo (3%)</span><span>{formatCurrency(pvSizing.misc)}</span></div>
+            </div>
+          </section>
 
-                <div className="mt-3 text-sm text-zinc-700">
-                  <div className="flex justify-between"><span>Base PV</span><span>{formatMoney(pvSizing.pvCost)}</span></div>
-                  <div className="flex justify-between"><span>Adder techo</span><span>{formatMoney(pvSizing.roofAdder)}</span></div>
-                  <div className="flex justify-between"><span>Permisos</span><span>{formatMoney(permits)}</span></div>
-                  <div className="flex justify-between"><span>Interconexión</span><span>{formatMoney(interconnection)}</span></div>
-                  <div className="flex justify-between"><span>Misceláneo (3%)</span><span>{formatMoney(pvSizing.misc)}</span></div>
-                </div>
+          {/* Batería */}
+          <section className="rounded-2xl border border-slate-200 p-4 shadow-sm">
+            <h2 className="text-base font-semibold">🔋 Batería</h2>
+
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-sm text-slate-700">Horas de respaldo</label>
+                <select
+                  value={backupHours}
+                  onChange={(e) => setBackupHours(parseFloat(e.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                >
+                  <option value={4}>4 horas</option>
+                  <option value={6}>6 horas</option>
+                  <option value={8}>8 horas</option>
+                  <option value={10}>10 horas</option>
+                  <option value={12}>12 horas</option>
+                </select>
               </div>
 
-              {/* Battery */}
-              <div className="rounded-2xl border border-zinc-200 p-4">
-                <div className="text-sm font-semibold">Batería</div>
-
-                <div className="mt-2">
-                  <label className="text-sm font-medium">Batería</label>
-                  <select
-                    value={batteryMode}
-                    onChange={(e) => setBatteryMode(e.target.value as any)}
-                    className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
-                  >
-                    <option value="recommended">Recomendada (según respaldo)</option>
-                    <option value="custom">Custom (kWh)</option>
-                    <option value="none">Sin batería</option>
-                  </select>
-                </div>
-
-                <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                  <div>
-                    <label className="text-sm font-medium">Horas de respaldo</label>
-                    <select
-                      value={backupHours}
-                      onChange={(e) => setBackupHours(parseInt(e.target.value, 10))}
-                      className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
-                      disabled={batteryMode === "none"}
-                    >
-                      {BACKUP_HOURS_OPTIONS.map((h) => (
-                        <option key={h} value={h}>
-                          {h} horas
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="text-sm font-medium">Cargas críticas</label>
-                    <select
-                      value={criticalKw}
-                      onChange={(e) => setCriticalKw(parseFloat(e.target.value))}
-                      className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
-                      disabled={batteryMode === "none"}
-                    >
-                      {CRITICAL_LOAD_OPTIONS.map((o) => (
-                        <option key={o.value} value={o.value}>
-                          {o.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  {batteryMode === "custom" && (
-                    <div className="sm:col-span-2">
-                      <label className="text-sm font-medium">kWh batería (custom)</label>
-                      <input
-                        type="number"
-                        value={customBatteryKwh}
-                        onChange={(e) => setCustomBatteryKwh(clamp(parseFloat(e.target.value || "0"), 0, 500))}
-                        className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 outline-none focus:border-zinc-400"
-                      />
-                    </div>
-                  )}
-                </div>
-
-                <div className="mt-3 rounded-xl border border-zinc-200 p-3">
-                  <div className="text-xs text-zinc-500">{battery.note}</div>
-                  <div className="mt-1 flex items-end justify-between">
-                    <div>
-                      <div className="text-sm text-zinc-600">Recomendado</div>
-                      <div className="text-xl font-semibold">{battery.kwh} kWh</div>
-                      {batteryMode === "recommended" && (
-                        <div className="text-xs text-zinc-500">
-                          Necesario aprox: {battery.requiredNominal} kWh (nominal)
-                        </div>
-                      )}
-                    </div>
-                    <div className="text-xl font-semibold">{formatMoney(battery.cost)}</div>
-                  </div>
-                </div>
-
-                <div className="mt-3 rounded-xl border border-zinc-900 bg-black p-3 text-white">
-                  <div className="text-xs opacity-80">Total PV + batería</div>
-                  <div className="text-2xl font-semibold">{formatMoney(totals.withBattery)}</div>
-                </div>
+              <div>
+                <label className="text-sm text-slate-700">Cargas críticas (kW típico)</label>
+                <select
+                  value={criticalKw}
+                  onChange={(e) => setCriticalKw(parseFloat(e.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                >
+                  <option value={1.0}>1.0 kW</option>
+                  <option value={1.5}>1.5 kW</option>
+                  <option value={2.0}>2.0 kW</option>
+                  <option value={2.5}>2.5 kW</option>
+                  <option value={3.0}>3.0 kW</option>
+                </select>
               </div>
             </div>
-          </div>
-        </div>
 
-        {/* Footer note */}
-        <div className="mt-6 text-xs text-zinc-500">
-          OCR: Si la factura tiene meses sin data, el app usa los meses disponibles (mín. {MIN_MONTHS_FOR_OCR}) y estima anual con promedio × 12.
+            <div className="mt-4 rounded-xl border border-slate-200 p-3 text-sm">
+              <div className="flex justify-between"><span className="text-slate-600">Necesario (aprox.)</span><span>{formatNumber(batterySizing.requiredKwh, 1)} kWh</span></div>
+              <div className="mt-1 flex justify-between">
+                <span className="text-slate-600">Recomendado</span>
+                <span className="font-semibold">{batterySizing.recommendedKwh} kWh</span>
+              </div>
+              <div className="mt-1 flex justify-between"><span className="text-slate-600">Costo batería</span><span className="font-semibold">{formatCurrency(batterySizing.batteryCost)}</span></div>
+            </div>
+
+            <div className="mt-4 rounded-xl border border-slate-200 p-3">
+              <div className="text-xs text-slate-500">Total PV + Batería</div>
+              <div className="mt-1 text-2xl font-semibold">{formatCurrency(totalWithBattery)}</div>
+            </div>
+          </section>
         </div>
       </div>
-    </div>
+    </main>
   );
 }
