@@ -1,584 +1,635 @@
-
 "use client";
 
-import React, { useMemo, useState } from "react";
-import Tesseract from "tesseract.js";
-import {
-  Check,
-  Info,
-  Zap,
-  BatteryCharging,
-  Calculator,
-  PhoneCall,
-  Upload,
-  Camera,
-  Clock,
-  PlugZap,
-} from "lucide-react";
+import React, { useMemo, useState, useEffect } from "react";
 
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Separator } from "@/components/ui/separator";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Badge } from "@/components/ui/badge";
+type RoofType = "Shingle" | "Metal" | "Concrete";
 
-const BATTERY_OPTIONS = [
-  { kwh: 5, label: "5 kWh" },
-  { kwh: 10, label: "10 kWh" },
-  { kwh: 16, label: "16 kWh" },
-  { kwh: 20, label: "20 kWh" },
-  { kwh: 32, label: "32 kWh" },
-  { kwh: 40, label: "40 kWh" },
-];
+const PV_PRICE_PER_W = 2.3; // $/W
+const SOLUNA_PRICE_PER_KWH = 350; // $/kWh
+const BATTERY_SIZES = [5, 10, 16, 20, 32, 40] as const;
 
-const PV_PRICE_PER_W = 2.3; // fixed
-const SOLUNA_PRICE_PER_KWH = 350; // fixed
-const BATTERY_USABLE_FACTOR = 0.9;
+const BATTERY_USABLE_FACTOR = 0.9; // usable energy factor (typical)
+const DAYS_PER_MONTH = 30.4;
 
-function clamp(n: number, min: number, max: number) {
+function clampNumber(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
+
+function roundTo(n: number, step: number) {
+  if (!Number.isFinite(n) || step <= 0) return n;
+  return Math.round(n / step) * step;
+}
+
 function formatMoney(n: number) {
-  const v = Number.isFinite(n) ? n : 0;
-  return v.toLocaleString(undefined, {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 0,
-  });
-}
-function formatNum(n: number, d = 1) {
-  const v = Number.isFinite(n) ? n : 0;
-  return v.toLocaleString(undefined, { maximumFractionDigits: d });
+  if (!Number.isFinite(n)) return "$0";
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
 }
 
-function nearestBatterySize(target: number) {
-  let best = BATTERY_OPTIONS[0].kwh;
-  let bestD = Math.abs(best - target);
-  for (const opt of BATTERY_OPTIONS) {
-    const d = Math.abs(opt.kwh - target);
-    if (d < bestD) {
-      bestD = d;
-      best = opt.kwh;
-    }
-  }
-  return best;
+function safeParseNumber(v: string) {
+  const x = Number(String(v).replace(/,/g, ""));
+  return Number.isFinite(x) ? x : 0;
 }
 
-function pick3AroundRecommended(recommendedKwh: number) {
-  const sorted = BATTERY_OPTIONS.map((b) => b.kwh).slice().sort((a, b) => a - b);
-  const idx = sorted.indexOf(recommendedKwh);
-  const smaller = idx > 0 ? sorted[idx - 1] : recommendedKwh;
-  const larger = idx >= 0 && idx < sorted.length - 1 ? sorted[idx + 1] : recommendedKwh;
-  const unique3 = Array.from(new Set([smaller, recommendedKwh, larger]));
-  return unique3.sort((a, b) => a - b);
-}
-
-export default function SunsolQuoteDemo() {
-  // Inputs
-  const [monthlyKwhManual, setMonthlyKwhManual] = useState<string>("");
-  const [ocrKwh, setOcrKwh] = useState<number | null>(null);
-  const [ocrBusy, setOcrBusy] = useState(false);
-  const [ocrStatus, setOcrStatus] = useState("");
-
-  // PV sizing assumptions
+export default function Page() {
+  // -----------------------------
+  // User inputs
+  // -----------------------------
+  const [monthlyKwh, setMonthlyKwh] = useState<string>(""); // can be OCR or manual
   const [offsetPct, setOffsetPct] = useState<number>(90);
-  const [psh, setPsh] = useState<number>(5.0);
+  const [psh, setPsh] = useState<number>(5);
   const [lossFactor, setLossFactor] = useState<number>(0.8);
   const [panelW, setPanelW] = useState<number>(450);
-  const [roofType, setRoofType] = useState<"shingle" | "concrete" | "metal" | "flat">("shingle");
+  const [roofType, setRoofType] = useState<RoofType>("Shingle");
 
-  // Fees (simple)
-  const [permitFee, setPermitFee] = useState<number>(1200);
-  const [interconnectionFee, setInterconnectionFee] = useState<number>(450);
+  const [permits, setPermits] = useState<number>(1200);
+  const [interconnection, setInterconnection] = useState<number>(450);
+  const [miscPct, setMiscPct] = useState<number>(3);
 
-  // Battery selection
-  const [batteryKwh, setBatteryKwh] = useState<"auto" | "none" | string>("auto");
-
-  // Battery sizing questions (#2)
+  // Battery sizing inputs
+  const [batteryMode, setBatteryMode] = useState<"recommended" | "manual">("recommended");
+  const [manualBatteryKwh, setManualBatteryKwh] = useState<number>(16);
   const [backupHours, setBackupHours] = useState<number>(8);
   const [criticalKw, setCriticalKw] = useState<number>(1.5);
 
-  // OCR handler
-  async function onUploadImage(file: File) {
-    setOcrBusy(true);
-    setOcrStatus("Leyendo imagen…");
-    setOcrKwh(null);
+  // OCR state
+  const [ocrBusy, setOcrBusy] = useState<boolean>(false);
+  const [ocrNote, setOcrNote] = useState<string>("");
 
-    try {
-      const dataUrl: string = await new Promise((resolve, reject) => {
-        const r = new FileReader();
-        r.onload = () => resolve(String(r.result));
-        r.onerror = reject;
-        r.readAsDataURL(file);
-      });
+  // Uploader UI state
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [lastFileName, setLastFileName] = useState<string | null>(null);
 
-      const res = await Tesseract.recognize(dataUrl, "eng");
-      const text = String(res?.data?.text || "");
-      const lower = text.toLowerCase();
+  // Cleanup blob urls
+  useEffect(() => {
+    return () => {
+      if (imagePreview) URL.revokeObjectURL(imagePreview);
+    };
+  }, [imagePreview]);
 
-      // Loose parse: find numbers near "kwh"
-      const cleaned = lower.replace(/[^0-9a-z.]/gi, " ");
-      const tokens = cleaned.split(" ").filter(Boolean);
+  // -----------------------------
+  // Roof adder (simple placeholder)
+  // You can tune these later
+  // -----------------------------
+  const roofAdderCost = useMemo(() => {
+    // You can set these to 0 if you don't want this adder
+    if (roofType === "Shingle") return 0;
+    if (roofType === "Metal") return 350;
+    if (roofType === "Concrete") return 650;
+    return 0;
+  }, [roofType]);
 
-      let best: number | null = null;
+  // -----------------------------
+  // Core calculations
+  // -----------------------------
+  const calc = useMemo(() => {
+    const kwhMonth = safeParseNumber(monthlyKwh);
+    const offset = clampNumber(offsetPct / 100, 0, 1);
+    const pshSafe = Math.max(0.1, psh);
+    const lossSafe = clampNumber(lossFactor, 0.3, 1);
 
-      for (let i = 0; i < tokens.length; i++) {
-        const t = tokens[i];
-        if (t === "kwh" || t.includes("kwh")) {
-          // look back a bit for numeric token
-          for (let j = i - 1; j >= Math.max(0, i - 6); j--) {
-            const cand = Number(tokens[j].replaceAll(",", ""));
-            if (Number.isFinite(cand) && cand >= 50 && cand <= 10000) {
-              best = best == null ? cand : Math.max(best, cand);
-              break;
-            }
-          }
-        }
-      }
+    // kWh/day
+    const kwhDay = kwhMonth / DAYS_PER_MONTH;
 
-      if (best != null) {
-        setOcrKwh(best);
-        setMonthlyKwhManual(String(best));
-        setOcrStatus(`kWh detectado: ${best}`);
-      } else {
-        setOcrStatus("No pude detectar kWh. Entra el kWh manual abajo.");
-      }
-    } catch (err) {
-      console.error(err);
-      setOcrStatus("No pude procesar la imagen. Prueba un recorte más nítido.");
-    } finally {
-      setOcrBusy(false);
-    }
-  }
+    // PV kW needed (DC-ish estimate)
+    // PV(kW) = (kWh/day * offset) / (PSH * losses)
+    const pvKw = (kwhDay * offset) / (pshSafe * lossSafe);
 
-  const computed = useMemo(() => {
-    // Monthly kWh priority: OCR -> manual
-    const manualKwh = Number(String(monthlyKwhManual).replaceAll(",", ""));
-    const monthlyKwh =
-      ocrKwh != null ? ocrKwh : Number.isFinite(manualKwh) && manualKwh > 0 ? manualKwh : 0;
+    // Panel count
+    const panelKw = Math.max(0.1, panelW) / 1000;
+    const rawPanels = pvKw / panelKw;
+    const panels = kwhMonth > 0 ? Math.max(1, Math.ceil(rawPanels)) : 0;
 
-    const dailyKwh = monthlyKwh / 30.4;
-    const targetDaily = dailyKwh * (clamp(offsetPct, 0, 100) / 100);
+    // Nameplate PV W
+    const pvW = panels * panelW;
 
-    const pshVal = clamp(Number(psh) || 0, 2.0, 7.5);
-    const lossVal = clamp(Number(lossFactor) || 0, 0.65, 0.9);
+    // PV base cost
+    const basePvCost = pvW * PV_PRICE_PER_W;
 
-    // PV sizing: kW = daily_kWh / (PSH * losses)
-    const pvKwIdeal = pshVal * lossVal > 0 ? targetDaily / (pshVal * lossVal) : 0;
+    // Misc
+    const miscCost = (basePvCost * clampNumber(miscPct, 0, 20)) / 100;
 
-    // Panel count / rounding
-    const pW = clamp(Number(panelW) || 450, 300, 700);
-    const panels = pW > 0 ? Math.ceil((pvKwIdeal * 1000) / pW) : 0;
-    const pvKwRounded = panels > 0 ? (panels * pW) / 1000 : 0;
+    // PV total without battery
+    const pvTotalNoBattery =
+      basePvCost + roofAdderCost + Math.max(0, permits) + Math.max(0, interconnection) + miscCost;
 
-    // Roof adder demo
-    const roofAdderPct =
-      roofType === "concrete" ? 0.03 : roofType === "metal" ? 0.06 : roofType === "flat" ? 0.04 : 0;
+    // Battery recommendation:
+    // needed usable kWh = criticalKw * hours
+    // required installed kWh = usable / factor
+    const neededUsableKwh = Math.max(0, criticalKw) * Math.max(0, backupHours);
+    const requiredInstalledKwh =
+      neededUsableKwh > 0 ? neededUsableKwh / BATTERY_USABLE_FACTOR : 0;
 
-    const basePvCost = pvKwRounded * 1000 * PV_PRICE_PER_W;
-    const roofAdderCost = basePvCost * roofAdderPct;
+    const recommendedBattery =
+      BATTERY_SIZES.find((s) => s >= requiredInstalledKwh) ?? BATTERY_SIZES[BATTERY_SIZES.length - 1];
 
-    const permits = clamp(Number(permitFee) || 0, 0, 99999);
-    const interconnection = clamp(Number(interconnectionFee) || 0, 0, 99999);
+    const selectedBatteryKwh = batteryMode === "recommended" ? recommendedBattery : manualBatteryKwh;
 
-    const miscPct = 0.03;
-    const miscCost = (basePvCost + roofAdderCost) * miscPct;
+    const batteryCost = Math.max(0, selectedBatteryKwh) * SOLUNA_PRICE_PER_KWH;
 
-    const pvTotalNoBattery = basePvCost + roofAdderCost + permits + interconnection + miscCost;
+    const totalWithBattery = pvTotalNoBattery + batteryCost;
 
-    // Battery recommendation based on backupHours * criticalKw
-    const requiredBatteryKwh = (backupHours * criticalKw) / BATTERY_USABLE_FACTOR;
-    const recommendedKwh = nearestBatterySize(requiredBatteryKwh);
-
-    const batteryKwhEffective =
-      batteryKwh === "auto"
-        ? recommendedKwh
-        : batteryKwh === "none"
-        ? null
-        : Number(batteryKwh);
-
-    const batteryCost = batteryKwhEffective ? batteryKwhEffective * SOLUNA_PRICE_PER_KWH : 0;
-
-    const three = pick3AroundRecommended(recommendedKwh);
-
-    // ✅ CORREGIDO: batteryCards usa pvTotalNoBattery (ya calculado)
-    const batteryCards = three.map((kwh) => {
-      const battCost = kwh * SOLUNA_PRICE_PER_KWH;
-      const totalWithBattery = pvTotalNoBattery + battCost;
-      const estHours = (kwh * BATTERY_USABLE_FACTOR) / Math.max(0.5, criticalKw);
-      const label =
-        kwh === recommendedKwh ? "Recomendada" : kwh < recommendedKwh ? "Económica" : "Premium";
-
-      return { kwh, label, batteryCost: battCost, totalCost: totalWithBattery, estHours };
-    });
+    // Estimated backup hours for selected battery
+    const estBackupHours =
+      criticalKw > 0 ? (selectedBatteryKwh * BATTERY_USABLE_FACTOR) / criticalKw : 0;
 
     return {
-      monthlyKwh,
-      dailyKwh,
-      pvKwRounded,
+      kwhMonth,
+      kwhDay,
+      pvKw,
       panels,
+      pvW,
       basePvCost,
-      roofAdderCost,
-      permits,
-      interconnection,
       miscCost,
       pvTotalNoBattery,
-      requiredBatteryKwh,
-      recommendedKwh,
-      batteryKwhEffective,
       batteryCost,
-      batteryCards,
+      totalWithBattery,
+      recommendedBattery,
+      selectedBatteryKwh,
+      estBackupHours,
+      requiredInstalledKwh,
     };
   }, [
-    monthlyKwhManual,
-    ocrKwh,
+    monthlyKwh,
     offsetPct,
     psh,
     lossFactor,
     panelW,
-    roofType,
-    permitFee,
-    interconnectionFee,
-    batteryKwh,
+    roofAdderCost,
+    permits,
+    interconnection,
+    miscPct,
+    batteryMode,
+    manualBatteryKwh,
     backupHours,
     criticalKw,
   ]);
 
+  // -----------------------------
+  // OCR / Image handling
+  // -----------------------------
+  const extractKwhFromText = (text: string): number | null => {
+    // Try to find something like 479.77 near "kwh"
+    // This is heuristic; you can tune later with real LUMA samples.
+    const cleaned = text.replace(/\s+/g, " ").toLowerCase();
+
+    // Match patterns like "kwh 479.77" or "479.77 kwh"
+    const patterns = [
+      /kwh[^0-9]{0,10}([0-9]{2,6}(?:\.[0-9]{1,3})?)/i,
+      /([0-9]{2,6}(?:\.[0-9]{1,3})?)[^a-z0-9]{0,10}kwh/i,
+    ];
+
+    for (const p of patterns) {
+      const m = cleaned.match(p);
+      if (m && m[1]) {
+        const n = safeParseNumber(m[1]);
+        if (n > 0) return n;
+      }
+    }
+
+    // Fallback: pick the largest “reasonable” number in text (50..5000)
+    const nums = cleaned.match(/[0-9]{2,6}(?:\.[0-9]{1,3})?/g) || [];
+    const candidates = nums
+      .map((s) => safeParseNumber(s))
+      .filter((n) => n >= 50 && n <= 5000);
+
+    if (candidates.length === 0) return null;
+    return Math.max(...candidates);
+  };
+
+  const processImageFile = async (file: File) => {
+    setOcrBusy(true);
+    setOcrNote("Leyendo imagen…");
+
+    try {
+      // Lazy import to keep bundle lighter
+      const Tesseract = (await import("tesseract.js")).default;
+
+      setOcrNote("Ejecutando OCR (puede tardar)…");
+      const res = await Tesseract.recognize(file, "eng", {
+        logger: (m: any) => {
+          if (m?.status === "recognizing text" && typeof m?.progress === "number") {
+            const pct = Math.round(m.progress * 100);
+            setOcrNote(`OCR: ${pct}%`);
+          }
+        },
+      });
+
+      const text = res?.data?.text || "";
+      const kwh = extractKwhFromText(text);
+
+      if (kwh && kwh > 0) {
+        setMonthlyKwh(String(roundTo(kwh, 0.01)));
+        setOcrNote(`kWh detectado: ${roundTo(kwh, 0.01)}`);
+      } else {
+        setOcrNote("No pude detectar el kWh. Escribe el kWh manualmente.");
+      }
+    } catch (e) {
+      setOcrNote("OCR falló. Escribe el kWh manualmente.");
+    } finally {
+      setOcrBusy(false);
+    }
+  };
+
+  const handleImageFile = async (file: File) => {
+    if (!file.type.startsWith("image/")) return;
+
+    setLastFileName(file.name);
+
+    const url = URL.createObjectURL(file);
+    setImagePreview((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return url;
+    });
+
+    await processImageFile(file);
+  };
+
+  const onCameraChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-upload same file
+    if (!file) return;
+    await handleImageFile(file);
+  };
+
+  const onGalleryChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    await handleImageFile(file);
+  };
+
+  const clearImage = () => {
+    setImagePreview((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
+    setLastFileName(null);
+    setOcrNote("");
+    setOcrBusy(false);
+    // (no borramos monthlyKwh automáticamente para no frustrar al cliente)
+  };
+
+  const onDropZone = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files?.[0];
+    if (!file) return;
+    await handleImageFile(file);
+  };
+
+  // -----------------------------
+  // UI
+  // -----------------------------
   return (
-    <div className="mx-auto max-w-5xl p-4 md:p-8">
-      <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Sunsol • Cotizador (sin vendedor)</h1>
-          <p className="text-sm text-muted-foreground">
-            PV: <b>$2.30/W</b> • Batería Soluna: <b>$350/kWh</b> • <b>Sin incentivos</b>
-          </p>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <Info className="h-4 w-4" />
-          Estimado preliminar. Validación final requiere inspección.
-        </div>
-      </div>
+    <div className="min-h-screen bg-gray-50 p-4">
+      <div className="mx-auto max-w-5xl space-y-4">
+        <header className="rounded-xl border bg-white p-4">
+          <div className="text-xl font-bold">Sunsol • Cotizador (sin vendedor)</div>
+          <div className="text-sm text-gray-600">
+            PV: <b>${PV_PRICE_PER_W.toFixed(2)}/W</b> • Batería Soluna: <b>${SOLUNA_PRICE_PER_KWH}/kWh</b> •{" "}
+            <b>Sin incentivos</b>
+          </div>
+          <div className="mt-2 text-xs text-gray-500">
+            Estimado preliminar. Validación final requiere inspección.
+          </div>
+        </header>
 
-      <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2">
-        <Card className="rounded-2xl">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Upload className="h-5 w-5" />
-              Foto / Screenshot de LUMA (historial)
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="rounded-2xl border p-3">
-              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                <div className="flex items-start gap-3">
-                  <div className="mt-0.5 rounded-xl border p-2">
-                    <Camera className="h-4 w-4" />
-                  </div>
-                  <div>
-                    <p className="text-sm font-medium">Sube una foto del área donde sale el kWh mensual</p>
-                    <p className="text-xs text-muted-foreground">
-                      Ideal: recorte nítido del cuadro que dice <b>kWh</b>.
-                    </p>
-                    {ocrStatus ? <p className="mt-1 text-xs text-muted-foreground">{ocrStatus}</p> : null}
-                  </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          {/* Uploader */}
+          <div className="rounded-xl border bg-white p-4">
+            <div className="mb-1 flex items-center justify-between">
+              <div className="text-base font-semibold">Foto / Screenshot de LUMA (historial)</div>
+              {ocrBusy ? (
+                <span className="text-xs font-medium text-gray-700">Procesando…</span>
+              ) : null}
+            </div>
+
+            <div className="text-sm text-gray-600">
+              Sube una foto del área donde sale el <b>kWh mensual</b>. Ideal: recorte nítido del cuadro que dice kWh.
+            </div>
+
+            {/* Inputs ocultos */}
+            <input
+              id="lumaCamera"
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              onChange={onCameraChange}
+              disabled={ocrBusy}
+            />
+            <input
+              id="lumaGallery"
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={onGalleryChange}
+              disabled={ocrBusy}
+            />
+
+            {/* Botones */}
+            <div className="mt-3 flex flex-wrap gap-2">
+              <label
+                htmlFor="lumaCamera"
+                className={`cursor-pointer rounded-md border px-3 py-2 text-sm font-medium shadow-sm active:scale-[0.99] ${
+                  ocrBusy ? "opacity-50 pointer-events-none" : ""
+                }`}
+              >
+                📷 Tomar foto
+              </label>
+
+              <label
+                htmlFor="lumaGallery"
+                className={`cursor-pointer rounded-md border px-3 py-2 text-sm font-medium shadow-sm active:scale-[0.99] ${
+                  ocrBusy ? "opacity-50 pointer-events-none" : ""
+                }`}
+              >
+                🖼️ Subir de galería
+              </label>
+
+              <button
+                type="button"
+                onClick={clearImage}
+                className="rounded-md border px-3 py-2 text-sm font-medium shadow-sm active:scale-[0.99]"
+                disabled={ocrBusy || (!imagePreview && !lastFileName && !ocrNote)}
+              >
+                🧽 Borrar
+              </button>
+            </div>
+
+            {/* Dropzone + preview */}
+            <div
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={onDropZone}
+              className="mt-3 rounded-lg border border-dashed bg-gray-50 p-3"
+            >
+              <div className="text-xs text-gray-600">En computadora: arrastra y suelta la imagen aquí.</div>
+
+              {lastFileName ? (
+                <div className="mt-2 text-xs text-gray-700">
+                  Archivo: <b>{lastFileName}</b>
                 </div>
+              ) : null}
 
+              {imagePreview ? (
+                <div className="mt-3">
+                  <img
+                    src={imagePreview}
+                    alt="Preview LUMA"
+                    className="max-h-64 w-full rounded-md object-contain"
+                  />
+                </div>
+              ) : (
+                <div className="mt-3 text-sm text-gray-500">No hay imagen seleccionada todavía.</div>
+              )}
+            </div>
+
+            {/* OCR note */}
+            <div className="mt-3 text-sm">
+              {ocrNote ? <div className="text-gray-700">{ocrNote}</div> : <div className="text-gray-500">—</div>}
+            </div>
+
+            {/* Manual entry */}
+            <div className="mt-3">
+              <label className="text-sm font-medium text-gray-800">Consumo mensual (kWh)</label>
+              <input
+                value={monthlyKwh}
+                onChange={(e) => setMonthlyKwh(e.target.value)}
+                placeholder="Ej: 480"
+                inputMode="decimal"
+                className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+              />
+              <div className="mt-1 text-xs text-gray-500">Si el OCR falla, escribe el kWh aquí.</div>
+            </div>
+          </div>
+
+          {/* Assumptions */}
+          <div className="rounded-xl border bg-white p-4">
+            <div className="text-base font-semibold">Supuestos del sistema</div>
+
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div>
+                <label className="text-sm font-medium text-gray-800">Offset (%)</label>
                 <input
-                  type="file"
-                  accept="image/*"
-                  disabled={ocrBusy}
-                  onChange={(e) => {
-                    const f = e.target.files && e.target.files[0];
-                    if (f) onUploadImage(f);
-                  }}
-                  className="block w-full max-w-[260px] text-sm"
+                  value={offsetPct}
+                  onChange={(e) => setOffsetPct(safeParseNumber(e.target.value))}
+                  inputMode="decimal"
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-gray-800">PSH</label>
+                <input
+                  value={psh}
+                  onChange={(e) => setPsh(safeParseNumber(e.target.value))}
+                  inputMode="decimal"
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-gray-800">Pérdidas (factor)</label>
+                <input
+                  value={lossFactor}
+                  onChange={(e) => setLossFactor(safeParseNumber(e.target.value))}
+                  inputMode="decimal"
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-gray-800">Panel (W)</label>
+                <input
+                  value={panelW}
+                  onChange={(e) => setPanelW(safeParseNumber(e.target.value))}
+                  inputMode="numeric"
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-gray-800">Techo</label>
+                <select
+                  value={roofType}
+                  onChange={(e) => setRoofType(e.target.value as RoofType)}
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                >
+                  <option value="Shingle">Shingle</option>
+                  <option value="Metal">Metal</option>
+                  <option value="Concrete">Concrete</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-gray-800">Permisos (est.)</label>
+                <input
+                  value={permits}
+                  onChange={(e) => setPermits(safeParseNumber(e.target.value))}
+                  inputMode="decimal"
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-gray-800">Interconexión (est.)</label>
+                <input
+                  value={interconnection}
+                  onChange={(e) => setInterconnection(safeParseNumber(e.target.value))}
+                  inputMode="decimal"
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-gray-800">Misceláneo (%)</label>
+                <input
+                  value={miscPct}
+                  onChange={(e) => setMiscPct(safeParseNumber(e.target.value))}
+                  inputMode="decimal"
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
                 />
               </div>
             </div>
 
-            <div>
-              <Label>Consumo mensual (kWh)</Label>
-              <Input
-                inputMode="numeric"
-                value={monthlyKwhManual}
-                onChange={(e) => setMonthlyKwhManual(e.target.value)}
-              />
-              <p className="text-xs text-muted-foreground">
-                Si el OCR falla, escribe el kWh aquí.
-              </p>
-            </div>
-          </CardContent>
-        </Card>
+            <div className="mt-3 text-xs text-gray-500">Precio instalado ($/W): fijo ${PV_PRICE_PER_W.toFixed(2)}. Sin incentivos.</div>
+          </div>
+        </div>
 
-        <Card className="rounded-2xl">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Calculator className="h-5 w-5" />
-              Supuestos del sistema
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="grid grid-cols-1 gap-3 md:grid-cols-2">
-            <div>
-              <Label>Offset (%)</Label>
-              <Input
-                inputMode="numeric"
-                value={offsetPct}
-                onChange={(e) => setOffsetPct(Number(e.target.value))}
-              />
-            </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          {/* PV results */}
+          <div className="rounded-xl border bg-white p-4">
+            <div className="text-base font-semibold">Resultado PV</div>
 
-            <div>
-              <Label>PSH</Label>
-              <Input inputMode="decimal" value={psh} onChange={(e) => setPsh(Number(e.target.value))} />
-            </div>
-
-            <div>
-              <Label>Pérdidas (factor)</Label>
-              <Input
-                inputMode="decimal"
-                value={lossFactor}
-                onChange={(e) => setLossFactor(Number(e.target.value))}
-              />
-            </div>
-
-            <div>
-              <Label>Panel (W)</Label>
-              <Input inputMode="numeric" value={panelW} onChange={(e) => setPanelW(Number(e.target.value))} />
-            </div>
-
-            <div>
-              <Label>Techo</Label>
-              <Select value={roofType} onValueChange={(v) => setRoofType(v as any)}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Selecciona" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="shingle">Shingle</SelectItem>
-                  <SelectItem value="concrete">Hormigón</SelectItem>
-                  <SelectItem value="metal">Metal</SelectItem>
-                  <SelectItem value="flat">Techo plano</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div>
-              <Label>Permisos (est.)</Label>
-              <Input inputMode="numeric" value={permitFee} onChange={(e) => setPermitFee(Number(e.target.value))} />
-            </div>
-
-            <div>
-              <Label>Interconexión (est.)</Label>
-              <Input
-                inputMode="numeric"
-                value={interconnectionFee}
-                onChange={(e) => setInterconnectionFee(Number(e.target.value))}
-              />
-            </div>
-
-            <div>
-              <Label>Precio instalado ($/W)</Label>
-              <Input value={PV_PRICE_PER_W} readOnly />
-              <p className="text-xs text-muted-foreground">Fijo. Sin incentivos.</p>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-3">
-        <Card className="rounded-2xl md:col-span-2">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Zap className="h-5 w-5" />
-              Resultado PV
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-              <div className="rounded-2xl border p-3">
-                <div className="text-xs text-muted-foreground">Consumo mensual</div>
-                <div className="text-2xl font-semibold">{formatNum(computed.monthlyKwh, 0)} kWh</div>
+            <div className="mt-3 grid gap-3 sm:grid-cols-3">
+              <div className="rounded-lg border p-3">
+                <div className="text-xs text-gray-500">Consumo mensual</div>
+                <div className="text-lg font-bold">{calc.kwhMonth ? `${roundTo(calc.kwhMonth, 0.01)} kWh` : "0 kWh"}</div>
               </div>
-              <div className="rounded-2xl border p-3">
-                <div className="text-xs text-muted-foreground">Sistema recomendado</div>
-                <div className="text-2xl font-semibold">{formatNum(computed.pvKwRounded, 1)} kW</div>
-                <div className="text-xs text-muted-foreground">{computed.panels} paneles (est.)</div>
+
+              <div className="rounded-lg border p-3">
+                <div className="text-xs text-gray-500">Sistema recomendado</div>
+                <div className="text-lg font-bold">{calc.panels ? `${roundTo(calc.pvKw, 0.01)} kW` : "0 kW"}</div>
+                <div className="text-xs text-gray-500">{calc.panels ? `${calc.panels} paneles (est.)` : "0 paneles (est.)"}</div>
               </div>
-              <div className="rounded-2xl border p-3">
-                <div className="text-xs text-muted-foreground">PV (sin batería)</div>
-                <div className="text-2xl font-semibold">{formatMoney(computed.pvTotalNoBattery)}</div>
+
+              <div className="rounded-lg border p-3">
+                <div className="text-xs text-gray-500">PV (sin batería)</div>
+                <div className="text-lg font-bold">{formatMoney(calc.pvTotalNoBattery)}</div>
               </div>
             </div>
 
-            <Separator />
-
-            <div className="text-sm">
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Base PV</span>
-                <span>{formatMoney(computed.basePvCost)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Adder techo</span>
-                <span>{formatMoney(computed.roofAdderCost)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Permisos</span>
-                <span>{formatMoney(computed.permits)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Interconexión</span>
-                <span>{formatMoney(computed.interconnection)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Misceláneo (3%)</span>
-                <span>{formatMoney(computed.miscCost)}</span>
-              </div>
+            <div className="mt-3 space-y-1 text-sm">
+              <div className="flex justify-between"><span>Base PV</span><span>{formatMoney(calc.basePvCost)}</span></div>
+              <div className="flex justify-between"><span>Adder techo</span><span>{formatMoney(roofAdderCost)}</span></div>
+              <div className="flex justify-between"><span>Permisos</span><span>{formatMoney(permits)}</span></div>
+              <div className="flex justify-between"><span>Interconexión</span><span>{formatMoney(interconnection)}</span></div>
+              <div className="flex justify-between"><span>Misceláneo ({miscPct}%)</span><span>{formatMoney(calc.miscCost)}</span></div>
             </div>
-          </CardContent>
-        </Card>
+          </div>
 
-        <Card className="rounded-2xl">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <BatteryCharging className="h-5 w-5" />
-              Batería
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div>
-              <Label>Batería</Label>
-              <Select value={batteryKwh} onValueChange={setBatteryKwh as any}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Selecciona" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="auto">Recomendada (según respaldo)</SelectItem>
-                  <SelectItem value="none">Sin batería</SelectItem>
-                  {BATTERY_OPTIONS.map((b) => (
-                    <SelectItem key={b.kwh} value={String(b.kwh)}>
-                      {b.label}
-                    </SelectItem>
+          {/* Battery */}
+          <div className="rounded-xl border bg-white p-4">
+            <div className="text-base font-semibold">Batería</div>
+
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div>
+                <label className="text-sm font-medium text-gray-800">Modo</label>
+                <select
+                  value={batteryMode}
+                  onChange={(e) => setBatteryMode(e.target.value as any)}
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                >
+                  <option value="recommended">Recomendada (según respaldo)</option>
+                  <option value="manual">Seleccionar tamaño</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-gray-800">Horas de respaldo</label>
+                <select
+                  value={backupHours}
+                  onChange={(e) => setBackupHours(safeParseNumber(e.target.value))}
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                >
+                  {[4, 6, 8, 10, 12, 16].map((h) => (
+                    <option key={h} value={h}>
+                      {h} horas
+                    </option>
                   ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="grid grid-cols-1 gap-3">
-              <div>
-                <Label className="flex items-center gap-2">
-                  <Clock className="h-4 w-4" /> Horas de respaldo
-                </Label>
-                <Select value={String(backupHours)} onValueChange={(v) => setBackupHours(Number(v))}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Selecciona" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="4">4 horas</SelectItem>
-                    <SelectItem value="8">8 horas</SelectItem>
-                    <SelectItem value="12">12 horas</SelectItem>
-                    <SelectItem value="24">24 horas</SelectItem>
-                  </SelectContent>
-                </Select>
+                </select>
               </div>
 
               <div>
-                <Label className="flex items-center gap-2">
-                  <PlugZap className="h-4 w-4" /> Cargas críticas
-                </Label>
-                <Select value={String(criticalKw)} onValueChange={(v) => setCriticalKw(Number(v))}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Selecciona" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="1">1.0 kW (mínimo)</SelectItem>
-                    <SelectItem value="1.5">1.5 kW (típico)</SelectItem>
-                    <SelectItem value="2">2.0 kW (alto)</SelectItem>
-                    <SelectItem value="3">3.0 kW (muy alto)</SelectItem>
-                  </SelectContent>
-                </Select>
+                <label className="text-sm font-medium text-gray-800">Cargas críticas (kW)</label>
+                <select
+                  value={criticalKw}
+                  onChange={(e) => setCriticalKw(safeParseNumber(e.target.value))}
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                >
+                  {[1, 1.5, 2, 3, 4, 5].map((k) => (
+                    <option key={k} value={k}>
+                      {k} kW (típico)
+                    </option>
+                  ))}
+                </select>
               </div>
-            </div>
 
-            <div className="rounded-2xl border p-3 text-sm">
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">Recomendado</span>
-                <span className="font-semibold">{computed.recommendedKwh} kWh</span>
-              </div>
-              <div className="mt-1 text-xs text-muted-foreground">
-                Necesario aprox.: {formatNum(computed.requiredBatteryKwh, 1)} kWh • Seleccionado:{" "}
-                {computed.batteryKwhEffective ? `${computed.batteryKwhEffective} kWh` : "Sin batería"}
-              </div>
-              <div className="mt-2 flex justify-between">
-                <span className="text-muted-foreground">Costo batería</span>
-                <span>{formatMoney(computed.batteryCost)}</span>
-              </div>
-            </div>
-
-            <Separator />
-
-            <div className="text-sm font-medium">Económica / Recomendada / Premium</div>
-            <div className="grid grid-cols-1 gap-3">
-              {computed.batteryCards.map((opt) => (
-                <div key={opt.kwh} className="rounded-2xl border p-3">
-                  <div className="flex items-center justify-between">
-                    <div className="font-medium">
-                      {opt.label}: {opt.kwh} kWh
-                    </div>
-                    <Badge className="rounded-full" variant="secondary">
-                      {formatMoney(opt.totalCost)}
-                    </Badge>
-                  </div>
-                  <div className="mt-1 text-xs text-muted-foreground">
-                    Batería: {formatMoney(opt.batteryCost)} • Respaldo aprox.: {formatNum(opt.estHours, 1)} h @{" "}
-                    {formatNum(criticalKw, 1)} kW
-                  </div>
-                  <div className="mt-3 flex gap-2">
-                    <Button
-                      variant={computed.batteryKwhEffective === opt.kwh ? "default" : "secondary"}
-                      className="rounded-2xl"
-                      onClick={() => setBatteryKwh(String(opt.kwh))}
-                    >
-                      {computed.batteryKwhEffective === opt.kwh ? "Seleccionada" : "Elegir"}
-                    </Button>
-                    <Button variant="outline" className="rounded-2xl" onClick={() => setBatteryKwh("auto")}>
-                      Auto
-                    </Button>
-                  </div>
+              <div>
+                <label className="text-sm font-medium text-gray-800">Tamaño batería</label>
+                <select
+                  value={batteryMode === "recommended" ? calc.recommendedBattery : manualBatteryKwh}
+                  onChange={(e) => setManualBatteryKwh(safeParseNumber(e.target.value))}
+                  className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                  disabled={batteryMode !== "manual"}
+                >
+                  {BATTERY_SIZES.map((s) => (
+                    <option key={s} value={s}>
+                      {s} kWh
+                    </option>
+                  ))}
+                </select>
+                <div className="mt-1 text-xs text-gray-500">
+                  Recomendada: <b>{calc.recommendedBattery} kWh</b> (necesaria aprox. {roundTo(calc.requiredInstalledKwh, 0.01)} kWh)
                 </div>
-              ))}
-            </div>
-
-            <Separator />
-
-            <div className="rounded-2xl border p-3">
-              <div className="text-xs text-muted-foreground">Total final (con selección actual)</div>
-              <div className="text-2xl font-semibold">
-                {formatMoney(computed.pvTotalNoBattery + computed.batteryCost)}
-              </div>
-              <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-                <Check className="h-4 w-4" />
-                Sin incentivo/crédito contributivo en este estimado.
               </div>
             </div>
 
-            <Button className="w-full rounded-2xl" variant="outline">
-              <PhoneCall className="mr-2 h-4 w-4" />
-              Continuar con Sunsol
-            </Button>
-          </CardContent>
-        </Card>
+            <div className="mt-4 rounded-lg border p-3">
+              <div className="flex justify-between text-sm">
+                <span>Batería seleccionada</span>
+                <b>{calc.selectedBatteryKwh} kWh</b>
+              </div>
+              <div className="flex justify-between text-sm mt-1">
+                <span>Costo batería</span>
+                <b>{formatMoney(calc.batteryCost)}</b>
+              </div>
+              <div className="flex justify-between text-sm mt-1">
+                <span>Horas estimadas (según cargas)</span>
+                <b>{Number.isFinite(calc.estBackupHours) ? roundTo(calc.estBackupHours, 0.1) : 0} h</b>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Total */}
+        <div className="rounded-xl border bg-white p-4">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <div className="text-base font-semibold">Total estimado</div>
+              <div className="text-xs text-gray-500">PV + permisos/interconexión/misceláneo + batería (si aplica). Sin incentivos.</div>
+            </div>
+
+            <div className="text-right">
+              <div className="text-xs text-gray-500">Total con batería</div>
+              <div className="text-2xl font-bold">{formatMoney(calc.totalWithBattery)}</div>
+            </div>
+          </div>
+        </div>
+
+        <footer className="pb-8 text-xs text-gray-500">
+          Nota: Este es un estimado preliminar automatizado. Precio final requiere evaluación de techo, distancias, paneles eléctricos, y requisitos de LUMA.
+        </footer>
       </div>
-
-      <p className="mt-6 text-xs text-muted-foreground">
-        Nota: El tamaño final depende de evaluación de techo, sombras, orientación y validación de cargas críticas.
-      </p>
     </div>
   );
 }
