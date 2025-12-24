@@ -3,71 +3,38 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * Sunsol – Cotizador (sin vendedor)
- *
- * OCR LUMA pág. 4 (Consumption History):
- * - Auto-crop por defecto (heurístico)
- * - Descarta eje Y por posición (margen izquierdo) aunque cambien sus números
- * - Considera SOLO números arriba de las barras
- * - Rango candidatos: 20–3000
- * - Usa los 12 más recientes (derecha → izquierda)
- * - Si faltan meses: usa >=4 y anual = (sum/meses)*12
- * - Botón “Recortar (manual)” (sliders) solo para afinar si OCR falla
- *
- * Requisito:
- *   npm i tesseract.js
+ * LUMA pág. 4 – CONSUMPTION HISTORY (KWH)
+ * Enfoque (SIN recorte manual):
+ * 1) Auto-crop amplio de la zona donde normalmente está la gráfica (no depende del eje Y).
+ * 2) Detecta barras por densidad de pixeles oscuros (visión, no OCR).
+ * 3) Para cada barra, recorta SOLO la franja arriba de la barra (donde está el numerito).
+ * 4) OCR por barra (números 20–3000).
+ * 5) Usa los 12 más recientes (más a la derecha). Si hay menos de 4: falla y pide input manual.
  */
 
-const PV_PRICE_PER_W = 2.30;
+const PV_PRICE_PER_W = 2.3;
 const SOLUNA_PRICE_PER_KWH = 350;
 
 const BATTERY_SIZES = [5, 10, 16, 20, 32, 40] as const;
 
-type OcrPick = {
-  value: number;
+type BarSegment = {
+  x0: number;
+  x1: number;
+  cx: number;
+};
+
+type OcrBar = {
+  x: number; // 0..1 dentro de chart
+  value: number | null;
   conf: number; // 0..100
-  x: number; // 0..1
-  y: number; // 0..1
-};
-
-type CropParams = {
-  // full → chart
-  chartTopPct: number;
-  chartBottomPct: number;
-  chartLeftPct: number;
-  chartRightPct: number;
-
-  // chart → labels band
-  labelsLeftPct: number;
-  labelsRightPct: number;
-  labelsTopPct: number;
-  labelsBottomPct: number;
-};
-
-const DEFAULT_AUTO_CROP: CropParams = {
-  // Más abajo en la página (pág 4 suele tener la gráfica en el tercio inferior)
-  chartTopPct: 0.56,
-  chartBottomPct: 0.98,
-  chartLeftPct: 0.03,
-  chartRightPct: 0.99,
-
-  // Dentro del chart:
-  // - elimina eje Y (izquierda)
-  // - incluye la zona donde están los numeritos encima de las barras (banda amplia)
-  labelsLeftPct: 0.16,
-  labelsRightPct: 0.995,
-  labelsTopPct: 0.12,
-  labelsBottomPct: 0.82,
 };
 
 function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
 }
-
 function round2(n: number) {
   return Math.round(n * 100) / 100;
 }
-
 function formatMoney(n: number) {
   return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
 }
@@ -104,13 +71,31 @@ function canvasToDataUrl(c: HTMLCanvasElement, quality = 0.92) {
   return c.toDataURL("image/jpeg", quality);
 }
 
+function cropPercent(full: HTMLCanvasElement, topPct: number, bottomPct: number, leftPct: number, rightPct: number) {
+  const W = full.width;
+  const H = full.height;
+  const y0 = Math.round(H * topPct);
+  const y1 = Math.round(H * bottomPct);
+  const x0 = Math.round(W * leftPct);
+  const x1 = Math.round(W * rightPct);
+
+  const w = Math.max(1, x1 - x0);
+  const h = Math.max(1, y1 - y0);
+
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  c.getContext("2d")!.drawImage(full, x0, y0, w, h, 0, 0, w, h);
+  return c;
+}
+
 /**
- * Pre-procesamiento simple para OCR:
+ * Prepro OCR:
  * - grayscale
- * - contraste leve
- * - threshold binario (para que los números “salten”)
+ * - threshold para que los numeritos queden negros y el resto blanco
+ * IMPORTANTE: esto se usa en ROIs pequeñas (arriba de cada barra), no en el chart completo.
  */
-function preprocessForOcr(src: HTMLCanvasElement): HTMLCanvasElement {
+function preprocessForDigits(src: HTMLCanvasElement, threshold = 185): HTMLCanvasElement {
   const c = document.createElement("canvas");
   c.width = src.width;
   c.height = src.height;
@@ -120,24 +105,14 @@ function preprocessForOcr(src: HTMLCanvasElement): HTMLCanvasElement {
   const img = ctx.getImageData(0, 0, c.width, c.height);
   const d = img.data;
 
-  // Ajustes (puedes afinar)
-  const contrast = 1.25; // 1.0 = no change
-  const threshold = 170; // 0..255
-
   for (let i = 0; i < d.length; i += 4) {
     const r = d[i];
     const g = d[i + 1];
     const b = d[i + 2];
-
-    // grayscale
     let y = 0.299 * r + 0.587 * g + 0.114 * b;
 
-    // contrast
-    y = (y - 128) * contrast + 128;
-    y = clamp(y, 0, 255);
-
-    // threshold
-    const v = y >= threshold ? 255 : 0;
+    // threshold binario
+    const v = y < threshold ? 0 : 255;
 
     d[i] = v;
     d[i + 1] = v;
@@ -149,185 +124,314 @@ function preprocessForOcr(src: HTMLCanvasElement): HTMLCanvasElement {
   return c;
 }
 
-function cropWithParams(full: HTMLCanvasElement, p: CropParams) {
-  const W = full.width;
-  const H = full.height;
-
-  const chartTop = Math.round(H * p.chartTopPct);
-  const chartBottom = Math.round(H * p.chartBottomPct);
-  const chartLeft = Math.round(W * p.chartLeftPct);
-  const chartRight = Math.round(W * p.chartRightPct);
-
-  const chartW = Math.max(1, chartRight - chartLeft);
-  const chartH = Math.max(1, chartBottom - chartTop);
-
-  const chart = document.createElement("canvas");
-  chart.width = chartW;
-  chart.height = chartH;
-  chart.getContext("2d")!.drawImage(full, chartLeft, chartTop, chartW, chartH, 0, 0, chartW, chartH);
-
-  const cw = chart.width;
-  const ch = chart.height;
-
-  const labelsLeft = Math.round(cw * p.labelsLeftPct);
-  const labelsRight = Math.round(cw * p.labelsRightPct);
-  const labelsTop = Math.round(ch * p.labelsTopPct);
-  const labelsBottom = Math.round(ch * p.labelsBottomPct);
-
-  const lw = Math.max(1, labelsRight - labelsLeft);
-  const lh = Math.max(1, labelsBottom - labelsTop);
-
-  const labels = document.createElement("canvas");
-  labels.width = lw;
-  labels.height = lh;
-  labels.getContext("2d")!.drawImage(chart, labelsLeft, labelsTop, lw, lh, 0, 0, lw, lh);
-
-  return {
-    chartCanvas: chart,
-    labelsCanvas: labels,
-  };
+function scaleCanvas(src: HTMLCanvasElement, scale = 3): HTMLCanvasElement {
+  const c = document.createElement("canvas");
+  c.width = Math.round(src.width * scale);
+  c.height = Math.round(src.height * scale);
+  const ctx = c.getContext("2d")!;
+  // para que engorde un poco el stroke de los dígitos
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(src, 0, 0, c.width, c.height);
+  return c;
 }
 
 /**
- * Import de tesseract.js compatible con varias versiones (ESM/CJS):
- * - mod.createWorker o mod.default.createWorker
- * - mod.recognize o mod.default.recognize
+ * Detecta barras por densidad vertical de pixeles “oscuros”.
+ * - Excluye margen izquierdo (eje Y) por posición.
+ * - No depende de los números del eje.
+ */
+function detectBars(chart: HTMLCanvasElement): BarSegment[] {
+  const ctx = chart.getContext("2d")!;
+  const W = chart.width;
+  const H = chart.height;
+
+  // Zona útil: excluye eje Y (margen izq) y algo de títulos
+  const xStart = Math.round(W * 0.12);
+  const xEnd = Math.round(W * 0.995);
+  const yStart = Math.round(H * 0.08);
+  const yEnd = Math.round(H * 0.95);
+
+  const img = ctx.getImageData(0, 0, W, H);
+  const d = img.data;
+
+  // Cuenta pixeles “no blancos” por columna
+  const col = new Array<number>(W).fill(0);
+
+  // Threshold suave para capturar barras grises (y NO depender del eje)
+  const darkTh = 215; // mientras más alto, más “detecta” grises
+
+  for (let y = yStart; y < yEnd; y++) {
+    for (let x = xStart; x < xEnd; x++) {
+      const i = (y * W + x) * 4;
+      const r = d[i];
+      const g = d[i + 1];
+      const b = d[i + 2];
+      const yv = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (yv < darkTh) col[x] += 1;
+    }
+  }
+
+  // Suaviza (moving average)
+  const smooth = new Array<number>(W).fill(0);
+  const win = 6;
+  for (let x = 0; x < W; x++) {
+    let s = 0;
+    let c = 0;
+    for (let k = -win; k <= win; k++) {
+      const xx = x + k;
+      if (xx >= 0 && xx < W) {
+        s += col[xx];
+        c += 1;
+      }
+    }
+    smooth[x] = s / Math.max(1, c);
+  }
+
+  // Umbral dinámico (los gridlines son finos → score bajo; barras → score alto)
+  let maxV = 0;
+  for (let x = xStart; x < xEnd; x++) maxV = Math.max(maxV, smooth[x]);
+
+  const th = Math.max(40, maxV * 0.42);
+
+  // Segmenta columnas "activas"
+  const segments: BarSegment[] = [];
+  let inSeg = false;
+  let seg0 = 0;
+
+  for (let x = xStart; x < xEnd; x++) {
+    const active = smooth[x] >= th;
+    if (active && !inSeg) {
+      inSeg = true;
+      seg0 = x;
+    }
+    if (!active && inSeg) {
+      const seg1 = x - 1;
+      inSeg = false;
+
+      const w = seg1 - seg0 + 1;
+      // filtros de ancho razonable para barras
+      if (w >= 6 && w <= Math.round(W * 0.12)) {
+        segments.push({ x0: seg0, x1: seg1, cx: (seg0 + seg1) / 2 });
+      }
+    }
+  }
+  if (inSeg) {
+    const seg1 = xEnd - 1;
+    const w = seg1 - seg0 + 1;
+    if (w >= 6 && w <= Math.round(W * 0.12)) segments.push({ x0: seg0, x1: seg1, cx: (seg0 + seg1) / 2 });
+  }
+
+  // A veces detecta una barra partida; merge si están muy cerca
+  const merged: BarSegment[] = [];
+  for (const s of segments) {
+    const last = merged[merged.length - 1];
+    if (!last) {
+      merged.push(s);
+      continue;
+    }
+    if (s.x0 - last.x1 <= 4) {
+      // merge
+      const x0 = last.x0;
+      const x1 = s.x1;
+      merged[merged.length - 1] = { x0, x1, cx: (x0 + x1) / 2 };
+    } else {
+      merged.push(s);
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Encuentra el top (y) de la barra: primera fila donde el área del segmento tiene suficiente “oscuro”.
+ * Esto permite recortar arriba de cada barra para capturar SOLO el numerito.
+ */
+function findBarTopY(chart: HTMLCanvasElement, seg: BarSegment): number | null {
+  const ctx = chart.getContext("2d")!;
+  const W = chart.width;
+  const H = chart.height;
+
+  const x0 = seg.x0;
+  const x1 = seg.x1;
+  const w = x1 - x0 + 1;
+
+  const yStart = Math.round(H * 0.08);
+  const yEnd = Math.round(H * 0.95);
+
+  const img = ctx.getImageData(0, 0, W, H);
+  const d = img.data;
+
+  const darkTh = 215;
+
+  for (let y = yStart; y < yEnd; y++) {
+    let darkCount = 0;
+    for (let x = x0; x <= x1; x++) {
+      const i = (y * W + x) * 4;
+      const r = d[i];
+      const g = d[i + 1];
+      const b = d[i + 2];
+      const yv = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (yv < darkTh) darkCount += 1;
+    }
+    // si en esa fila hay suficiente “oscuro”, probablemente empezó la barra
+    if (darkCount >= Math.max(3, Math.round(w * 0.35))) {
+      return y;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Construye ROIs (franjita arriba de cada barra) + un preview strip.
+ */
+function buildLabelRois(chart: HTMLCanvasElement, segments: BarSegment[]) {
+  const W = chart.width;
+  const H = chart.height;
+
+  const rois: { canvas: HTMLCanvasElement; xNorm: number }[] = [];
+
+  const padX = 10;
+  const roiHeight = Math.round(H * 0.16); // franja arriba (proporcional al chart)
+  const gapAboveBar = 4; // evita tocar la barra
+
+  for (const s of segments) {
+    const topY = findBarTopY(chart, s);
+    if (topY == null) continue;
+
+    const x0 = clamp(s.x0 - padX, 0, W - 1);
+    const x1 = clamp(s.x1 + padX, 0, W - 1);
+
+    const y1 = clamp(topY - gapAboveBar, 0, H - 1);
+    const y0 = clamp(y1 - roiHeight, 0, H - 1);
+
+    const w = Math.max(1, x1 - x0 + 1);
+    const h = Math.max(1, y1 - y0 + 1);
+
+    // ROI original
+    const roi = document.createElement("canvas");
+    roi.width = w;
+    roi.height = h;
+    roi.getContext("2d")!.drawImage(chart, x0, y0, w, h, 0, 0, w, h);
+
+    // Scale up + binariza para OCR
+    const scaled = scaleCanvas(roi, 3);
+    const pre = preprocessForDigits(scaled, 185);
+
+    rois.push({ canvas: pre, xNorm: s.cx / W });
+  }
+
+  // Preview strip (solo para ver lo que realmente OCR está leyendo)
+  const cellH = rois.length ? rois[0].canvas.height : 1;
+  const cellW = rois.length ? rois[0].canvas.width : 1;
+  const strip = document.createElement("canvas");
+  strip.width = Math.max(1, rois.length * (cellW + 14) + 14);
+  strip.height = Math.max(1, cellH + 14);
+  const sctx = strip.getContext("2d")!;
+  sctx.fillStyle = "white";
+  sctx.fillRect(0, 0, strip.width, strip.height);
+
+  rois.forEach((r, idx) => {
+    const x = 7 + idx * (cellW + 14);
+    const y = 7;
+    sctx.drawImage(r.canvas, x, y);
+  });
+
+  return { rois, strip };
+}
+
+/**
+ * Import de tesseract.js compatible con varias versiones.
  */
 async function loadTesseractModule() {
   const mod: any = await import("tesseract.js");
   const createWorker = mod?.createWorker ?? mod?.default?.createWorker;
   const recognize = mod?.recognize ?? mod?.default?.recognize;
-
   return { createWorker, recognize };
 }
 
+function bestNumberFromTessData(data: any) {
+  const words = (data?.words ?? []) as Array<{ text: string; confidence: number }>;
+  const candidates: { value: number; conf: number }[] = [];
+
+  for (const w of words) {
+    const cleaned = (w.text ?? "").replace(/[^\d]/g, "");
+    if (!cleaned) continue;
+    if (cleaned.length < 2 || cleaned.length > 4) continue;
+
+    const val = parseInt(cleaned, 10);
+    if (!Number.isFinite(val)) continue;
+    if (val < 20 || val > 3000) continue;
+
+    candidates.push({ value: val, conf: w.confidence ?? 0 });
+  }
+
+  // fallback usando text completo
+  if (!candidates.length) {
+    const t = (data?.text ?? "") as string;
+    const matches = t.match(/\d{2,4}/g) ?? [];
+    for (const m of matches) {
+      const val = parseInt(m, 10);
+      if (!Number.isFinite(val)) continue;
+      if (val < 20 || val > 3000) continue;
+      candidates.push({ value: val, conf: data?.confidence ?? 0 });
+    }
+  }
+
+  if (!candidates.length) return { value: null as number | null, conf: 0 };
+
+  candidates.sort((a, b) => b.conf - a.conf);
+  return { value: candidates[0].value, conf: candidates[0].conf };
+}
+
 /**
- * OCR SOLO números arriba de barras (labelsCanvas ya excluye eje Y por margen izquierdo).
- * Ordena por X, dedup por cercanía y toma los 12 más a la derecha.
+ * OCR por barra (ROI por barra) usando UN worker para todo.
  */
-async function runOcrOnCanvasNumbersOnly(labelsCanvasRaw: HTMLCanvasElement) {
+async function ocrBars(rois: { canvas: HTMLCanvasElement; xNorm: number }[]) {
   const { createWorker, recognize } = await loadTesseractModule();
 
-  // Preprocesa para OCR
-  const labelsCanvas = preprocessForOcr(labelsCanvasRaw);
-  const imgDataUrl = canvasToDataUrl(labelsCanvas);
-
-  let data: any = null;
-
-  // Preferimos worker, pero soportamos fallback
+  // Preferimos worker para rendimiento
   if (typeof createWorker === "function") {
     const worker = await createWorker();
 
-    // Algunas versiones requieren worker.load()
     if (typeof worker.load === "function") await worker.load();
-
-    // Algunas versiones tienen loadLanguage/initialize; otras reinitialize
-    if (typeof worker.loadLanguage === "function") {
-      await worker.loadLanguage("eng");
-    }
-    if (typeof worker.initialize === "function") {
-      await worker.initialize("eng");
-    } else if (typeof worker.reinitialize === "function") {
-      await worker.reinitialize("eng");
-    }
+    if (typeof worker.loadLanguage === "function") await worker.loadLanguage("eng");
+    if (typeof worker.initialize === "function") await worker.initialize("eng");
+    else if (typeof worker.reinitialize === "function") await worker.reinitialize("eng");
 
     if (typeof worker.setParameters === "function") {
       await worker.setParameters({
         tessedit_char_whitelist: "0123456789",
-        // PSM 11: sparse text (mejor para numeritos sueltos)
-        tessedit_pageseg_mode: "11",
+        tessedit_pageseg_mode: "7", // single line (cada ROI es una “línea”)
+        user_defined_dpi: "300",
       });
     }
 
-    const res = await worker.recognize(imgDataUrl);
-    data = res?.data;
+    const out: OcrBar[] = [];
+    for (const r of rois) {
+      const res = await worker.recognize(r.canvas);
+      const best = bestNumberFromTessData(res?.data);
+      out.push({ x: r.xNorm, value: best.value, conf: best.conf });
+    }
+
     if (typeof worker.terminate === "function") await worker.terminate();
-  } else if (typeof recognize === "function") {
-    const res = await recognize(imgDataUrl, "eng", {
-      tessedit_char_whitelist: "0123456789",
-    });
-    data = res?.data;
-  } else {
-    throw new Error("No se pudo cargar tesseract.js (createWorker/recognize no disponible).");
+    return out;
   }
 
-  const W = labelsCanvas.width;
-  const H = labelsCanvas.height;
-
-  const words = (data?.words ?? []) as Array<{
-    text: string;
-    confidence: number; // 0..100
-    bbox: { x0: number; y0: number; x1: number; y1: number };
-  }>;
-
-  const picks: OcrPick[] = [];
-  for (const w of words) {
-    const raw = (w.text ?? "").trim();
-    if (!raw) continue;
-
-    const cleaned = raw.replace(/[^\d]/g, "");
-    if (!cleaned) continue;
-    if (cleaned.length > 4) continue;
-
-    const val = parseInt(cleaned, 10);
-    if (!Number.isFinite(val)) continue;
-
-    // rango solicitado
-    if (val < 20 || val > 3000) continue;
-
-    const bb = w.bbox;
-    const cx = (bb.x0 + bb.x1) / 2;
-    const cy = (bb.y0 + bb.y1) / 2;
-
-    // tamaños mínimos para evitar ruido
-    const bw = Math.max(1, bb.x1 - bb.x0);
-    const bh = Math.max(1, bb.y1 - bb.y0);
-    if (bw < 8 || bh < 12) continue;
-
-    picks.push({
-      value: val,
-      conf: w.confidence ?? 0,
-      x: cx / W,
-      y: cy / H,
-    });
-  }
-
-  // Orden por X (izq→der)
-  const sortedByX = [...picks].sort((a, b) => a.x - b.x);
-
-  // Dedup por “slot” de barra (si detecta doble en la misma barra, guarda el de más conf)
-  const merged: OcrPick[] = [];
-  const MERGE_X = 0.032; // ~3.2% del ancho
-
-  for (const p of sortedByX) {
-    const last = merged[merged.length - 1];
-    if (!last) {
-      merged.push(p);
-      continue;
+  // Fallback (más lento): recognize directo
+  if (typeof recognize === "function") {
+    const out: OcrBar[] = [];
+    for (const r of rois) {
+      const res = await recognize(r.canvas, "eng", {
+        tessedit_char_whitelist: "0123456789",
+      });
+      const best = bestNumberFromTessData(res?.data);
+      out.push({ x: r.xNorm, value: best.value, conf: best.conf });
     }
-    if (Math.abs(p.x - last.x) <= MERGE_X) {
-      if (p.conf > last.conf) merged[merged.length - 1] = p;
-    } else {
-      merged.push(p);
-    }
+    return out;
   }
 
-  // Toma 12 más recientes (los 12 más a la derecha)
-  const used = merged.length > 12 ? merged.slice(merged.length - 12) : merged;
-
-  const valuesUsed = used.map((p) => p.value);
-  const sum = valuesUsed.reduce((a, b) => a + b, 0);
-  const monthsUsed = valuesUsed.length;
-
-  return {
-    picksAll: merged,
-    picksUsed: used,
-    valuesUsed,
-    monthsUsed,
-    annualEstimated: monthsUsed >= 1 ? (sum / monthsUsed) * 12 : 0,
-    monthlyAverage: monthsUsed >= 1 ? sum / monthsUsed : 0,
-    avgConfidence: used.length ? used.reduce((a, b) => a + b.conf, 0) / used.length : 0,
-  };
+  throw new Error("No se pudo cargar tesseract.js (createWorker/recognize no disponible).");
 }
 
 export default function Page() {
@@ -335,36 +439,29 @@ export default function Page() {
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
 
   const [rawImageUrl, setRawImageUrl] = useState<string | null>(null);
-  const [previewChartUrl, setPreviewChartUrl] = useState<string | null>(null);
-  const [previewLabelsUrl, setPreviewLabelsUrl] = useState<string | null>(null);
+  const [chartPreviewUrl, setChartPreviewUrl] = useState<string | null>(null);
+  const [stripPreviewUrl, setStripPreviewUrl] = useState<string | null>(null);
 
   const [ocrBusy, setOcrBusy] = useState(false);
   const [ocrError, setOcrError] = useState<string | null>(null);
+
+  const [monthlyKwh, setMonthlyKwh] = useState<number>(0);
 
   const [ocrMonthlyAvg, setOcrMonthlyAvg] = useState<number>(0);
   const [ocrAnnual, setOcrAnnual] = useState<number>(0);
   const [ocrMonthsUsed, setOcrMonthsUsed] = useState<number>(0);
   const [ocrConfidence, setOcrConfidence] = useState<number>(0);
 
-  const [ocrValuesAll, setOcrValuesAll] = useState<number[]>([]);
-  const [ocrValuesUsed, setOcrValuesUsed] = useState<number[]>([]);
+  const [valuesDetectedAll, setValuesDetectedAll] = useState<number[]>([]);
+  const [valuesUsed12, setValuesUsed12] = useState<number[]>([]);
+  const [commercialFlag, setCommercialFlag] = useState<boolean>(false);
 
-  const [monthlyKwh, setMonthlyKwh] = useState<number>(0);
-
-  // Crop params (manual)
-  const [showManualCrop, setShowManualCrop] = useState(false);
-  const [cropParams, setCropParams] = useState<CropParams>({ ...DEFAULT_AUTO_CROP });
-
-  // Store last full canvas (para reprocesar sin re-subir)
-  const fullCanvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  // Assumptions
+  // Assumptions PV
   const [offsetPct, setOffsetPct] = useState<number>(90);
   const [psh, setPsh] = useState<number>(5);
   const [lossFactor, setLossFactor] = useState<number>(0.8);
   const [panelW, setPanelW] = useState<number>(450);
 
-  const [roofType, setRoofType] = useState<"Shingle" | "Metal" | "Concrete" | "Other">("Shingle");
   const [permits, setPermits] = useState<number>(1200);
   const [interconnection, setInterconnection] = useState<number>(450);
   const [miscPct, setMiscPct] = useState<number>(3);
@@ -372,16 +469,10 @@ export default function Page() {
   const [backupHours, setBackupHours] = useState<number>(8);
   const [criticalKw, setCriticalKw] = useState<number>(1.5);
 
+  // Si OCR da promedio, úsalo como input
   useEffect(() => {
     if (ocrMonthlyAvg > 0) setMonthlyKwh(round2(ocrMonthlyAvg));
   }, [ocrMonthlyAvg]);
-
-  const roofAdderCost = useMemo(() => {
-    if (roofType === "Shingle") return 0;
-    if (roofType === "Metal") return 800;
-    if (roofType === "Concrete") return 1500;
-    return 500;
-  }, [roofType]);
 
   const monthlyForSizing = useMemo(() => Math.max(0, monthlyKwh || 0), [monthlyKwh]);
 
@@ -401,13 +492,12 @@ export default function Page() {
   const basePvCost = useMemo(() => {
     const pvCost = pvWattsRecommended * PV_PRICE_PER_W;
     const misc = (pvCost * miscPct) / 100;
-    return pvCost + misc + roofAdderCost + permits + interconnection;
-  }, [pvWattsRecommended, miscPct, roofAdderCost, permits, interconnection]);
+    return pvCost + misc + permits + interconnection;
+  }, [pvWattsRecommended, miscPct, permits, interconnection]);
 
   const batteryCards = useMemo(() => {
     const usableFactor = 0.9;
     const requiredKwhNominal = (criticalKw * backupHours) / usableFactor;
-
     const sorted = [...BATTERY_SIZES].sort((a, b) => a - b);
     const recommended = sorted.find((k) => k >= requiredKwhNominal) ?? sorted[sorted.length - 1];
 
@@ -415,64 +505,86 @@ export default function Page() {
       const battCost = kwh * SOLUNA_PRICE_PER_KWH;
       const total = basePvCost + battCost;
       const estHours = (kwh * usableFactor) / Math.max(0.5, criticalKw);
-      return {
-        kwh,
-        battCost,
-        total,
-        estHours,
-        isRecommended: kwh === recommended,
-      };
+      return { kwh, battCost, total, estHours, isRecommended: kwh === recommended };
     });
   }, [basePvCost, backupHours, criticalKw]);
 
-  async function processFromFullCanvas(full: HTMLCanvasElement, params: CropParams) {
+  async function handleFile(file: File) {
     setOcrError(null);
-    setOcrValuesAll([]);
-    setOcrValuesUsed([]);
-    setOcrMonthsUsed(0);
-    setOcrConfidence(0);
-    setOcrAnnual(0);
+    setCommercialFlag(false);
+    setValuesDetectedAll([]);
+    setValuesUsed12([]);
     setOcrMonthlyAvg(0);
+    setOcrAnnual(0);
+    setOcrConfidence(0);
+    setOcrMonthsUsed(0);
 
-    const { chartCanvas, labelsCanvas } = cropWithParams(full, params);
+    const img = await loadImageFromFile(file);
+    const full = canvasFromImage(img, 1700);
 
-    setPreviewChartUrl(canvasToDataUrl(chartCanvas));
-    setPreviewLabelsUrl(canvasToDataUrl(labelsCanvas));
+    setRawImageUrl(canvasToDataUrl(full));
+
+    // Auto-crop amplio en la zona inferior/media donde vive la gráfica
+    // (si incluyes un poco de más, NO pasa nada: barras detection filtra)
+    const chart = cropPercent(full, 0.42, 0.93, 0.02, 0.99);
+    setChartPreviewUrl(canvasToDataUrl(chart));
+
+    // Detectar barras por visión
+    const segments = detectBars(chart);
+
+    // Construir ROIs (arriba de cada barra)
+    const { rois, strip } = buildLabelRois(chart, segments);
+    setStripPreviewUrl(canvasToDataUrl(strip));
 
     setOcrBusy(true);
     try {
-      const r = await runOcrOnCanvasNumbersOnly(labelsCanvas);
-
-      setOcrValuesAll(r.picksAll.map((p) => p.value));
-      setOcrValuesUsed(r.valuesUsed);
-      setOcrMonthsUsed(r.monthsUsed);
-      setOcrConfidence(r.avgConfidence);
-
-      if (r.monthsUsed >= 4) {
-        setOcrAnnual(round2(r.annualEstimated));
-        setOcrMonthlyAvg(round2(r.monthlyAverage));
-      } else {
-        setOcrError(
-          "OCR insuficiente: se detectaron menos de 4 meses. Usa “Recortar (manual)” o escribe el kWh mensual promedio."
-        );
+      if (rois.length < 4) {
+        setOcrError("No pude detectar suficientes barras. Asegúrate que sea la página 4 completa y nítida.");
+        return;
       }
+
+      // OCR por barra
+      const bars = await ocrBars(rois);
+
+      // Orden por X (izq→der)
+      bars.sort((a, b) => a.x - b.x);
+
+      const detectedVals = bars.map((b) => b.value).filter((v): v is number => typeof v === "number");
+      setValuesDetectedAll(detectedVals);
+
+      // 12 más recientes (derecha)
+      const numericBars = bars.filter((b) => typeof b.value === "number") as Array<OcrBar & { value: number }>;
+      const used = numericBars.length > 12 ? numericBars.slice(numericBars.length - 12) : numericBars;
+
+      if (used.length < 4) {
+        setOcrError("OCR insuficiente: se detectaron menos de 4 meses. Toma la foto más nítida y completa.");
+        return;
+      }
+
+      // Comercial flag
+      const hasOver3000 = used.some((u) => u.value > 3000);
+      setCommercialFlag(hasOver3000);
+
+      const valuesUsed = used.map((u) => u.value);
+      setValuesUsed12(valuesUsed);
+
+      const sum = valuesUsed.reduce((a, b) => a + b, 0);
+      const monthsUsed = valuesUsed.length;
+
+      const monthlyAvg = sum / monthsUsed;
+      const annual = monthlyAvg * 12;
+
+      const avgConf = used.reduce((a, b) => a + (b.conf ?? 0), 0) / monthsUsed;
+
+      setOcrMonthsUsed(monthsUsed);
+      setOcrMonthlyAvg(round2(monthlyAvg));
+      setOcrAnnual(round2(annual));
+      setOcrConfidence(round2(avgConf));
     } catch (e: any) {
       setOcrError(e?.message ?? "Error de OCR");
     } finally {
       setOcrBusy(false);
     }
-  }
-
-  async function handleFile(file: File) {
-    const img = await loadImageFromFile(file);
-    const fullCanvas = canvasFromImage(img, 1700);
-    fullCanvasRef.current = fullCanvas;
-
-    setRawImageUrl(canvasToDataUrl(fullCanvas));
-
-    // Auto-crop por defecto
-    setCropParams({ ...DEFAULT_AUTO_CROP });
-    await processFromFullCanvas(fullCanvas, DEFAULT_AUTO_CROP);
   }
 
   function onPickCamera() {
@@ -498,9 +610,8 @@ export default function Page() {
           <div className="rounded-2xl border border-neutral-200 p-4 shadow-sm">
             <div className="text-lg font-semibold">Foto / Screenshot de LUMA (página 4)</div>
             <div className="mt-2 text-sm text-neutral-600">
-              Instrucciones: Usa la página 4 de LUMA donde aparece la gráfica{" "}
-              <span className="font-medium">“CONSUMPTION HISTORY (KWH)”</span> (o “Historial de consumo”). Toma la{" "}
-              <span className="font-medium">foto completa</span> de la página (sin recortar), nítida y sin reflejos.
+              Usa la página 4 donde aparece <span className="font-medium">“CONSUMPTION HISTORY (KWH)”</span>. Toma la{" "}
+              <span className="font-medium">página completa</span>, nítida y sin reflejos.
             </div>
 
             <div className="mt-4 flex flex-wrap gap-2">
@@ -554,7 +665,9 @@ export default function Page() {
                   placeholder="Ej. 600"
                   className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
                 />
-                <div className="mt-2 text-xs text-neutral-500">Si el OCR falla, escribe el promedio mensual aquí.</div>
+                <div className="mt-2 text-xs text-neutral-500">
+                  Si el OCR falla, escribe el promedio mensual aquí.
+                </div>
 
                 <div className="mt-3 text-xs text-neutral-700">
                   {ocrBusy ? (
@@ -570,8 +683,13 @@ export default function Page() {
                       </div>
                       <div>
                         <span className="font-medium">OCR confianza:</span>{" "}
-                        {ocrConfidence > 0 ? `${round2(ocrConfidence)}%` : "—"}
+                        {ocrConfidence > 0 ? `${ocrConfidence}%` : "—"}
                       </div>
+                      {commercialFlag && (
+                        <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                          ⚠️ Se detectó un mes &gt; 3000 kWh. Probable caso comercial (requiere estimado distinto).
+                        </div>
+                      )}
                     </>
                   )}
                 </div>
@@ -581,27 +699,6 @@ export default function Page() {
                     {ocrError}
                   </div>
                 )}
-
-                <div className="mt-3 flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowManualCrop((v) => !v)}
-                    className="rounded-xl border border-neutral-300 bg-white px-3 py-2 text-xs font-medium"
-                  >
-                    ✂️ Recortar (manual)
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      if (!fullCanvasRef.current) return;
-                      await processFromFullCanvas(fullCanvasRef.current, cropParams);
-                    }}
-                    className="rounded-xl bg-neutral-900 px-3 py-2 text-xs font-medium text-white"
-                  >
-                    🔁 Reprocesar OCR
-                  </button>
-                </div>
               </div>
 
               <div className="rounded-xl border border-neutral-200 p-3">
@@ -620,10 +717,10 @@ export default function Page() {
                   </div>
 
                   <div className="rounded-lg border border-neutral-200 p-1">
-                    <div className="px-1 pb-1 text-[10px] text-neutral-500">Auto-crop (números)</div>
-                    {previewLabelsUrl ? (
+                    <div className="px-1 pb-1 text-[10px] text-neutral-500">Auto-crop (zona gráfica)</div>
+                    {chartPreviewUrl ? (
                       // eslint-disable-next-line @next/next/no-img-element
-                      <img alt="labels" src={previewLabelsUrl} className="h-28 w-full rounded-md object-cover" />
+                      <img alt="chart" src={chartPreviewUrl} className="h-28 w-full rounded-md object-cover" />
                     ) : (
                       <div className="flex h-28 items-center justify-center rounded-md bg-neutral-50 text-xs text-neutral-400">
                         —
@@ -632,9 +729,18 @@ export default function Page() {
                   </div>
                 </div>
 
-                <div className="mt-3 text-[11px] text-neutral-500">
-                  Nota: el crop descarta el eje Y por posición (margen izquierdo). Solo intenta leer los numeritos arriba
-                  de las barras. Si el preview no muestra todos los números, usa “Recortar (manual)”.
+                <div className="mt-2 rounded-lg border border-neutral-200 p-1">
+                  <div className="px-1 pb-1 text-[10px] text-neutral-500">
+                    Lo que OCR realmente lee (ROIs arriba de barras)
+                  </div>
+                  {stripPreviewUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img alt="strip" src={stripPreviewUrl} className="h-20 w-full rounded-md object-contain bg-white" />
+                  ) : (
+                    <div className="flex h-20 items-center justify-center rounded-md bg-neutral-50 text-xs text-neutral-400">
+                      —
+                    </div>
+                  )}
                 </div>
 
                 <details className="mt-3">
@@ -644,67 +750,19 @@ export default function Page() {
                   <div className="mt-2 text-xs text-neutral-600">
                     <div>
                       <span className="font-medium">Detectados:</span>{" "}
-                      {ocrValuesAll.length ? ocrValuesAll.join(", ") : "—"}
+                      {valuesDetectedAll.length ? valuesDetectedAll.join(", ") : "—"}
                     </div>
                     <div className="mt-1">
                       <span className="font-medium">Usados (12 más recientes):</span>{" "}
-                      {ocrValuesUsed.length ? ocrValuesUsed.join(", ") : "—"}
+                      {valuesUsed12.length ? valuesUsed12.join(", ") : "—"}
                     </div>
                   </div>
                 </details>
               </div>
             </div>
-
-            {showManualCrop && (
-              <div className="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 p-3">
-                <div className="text-sm font-semibold">Recorte manual (sliders)</div>
-                <div className="mt-1 text-xs text-neutral-600">
-                  Ajusta solo si el OCR falla. Objetivo: que el preview “Auto-crop (números)” muestre todos los numeritos
-                  encima de las barras, sin incluir el eje Y.
-                </div>
-
-                <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                  {(
-                    [
-                      ["chartTopPct", "Chart top", 0.40, 0.75],
-                      ["chartBottomPct", "Chart bottom", 0.85, 0.99],
-                      ["labelsLeftPct", "Labels left (quita eje Y)", 0.10, 0.30],
-                      ["labelsRightPct", "Labels right", 0.90, 1.0],
-                      ["labelsTopPct", "Labels top", 0.00, 0.30],
-                      ["labelsBottomPct", "Labels bottom (quita meses)", 0.55, 0.95],
-                    ] as Array<[keyof CropParams, string, number, number]>
-                  ).map(([key, label, min, max]) => (
-                    <div key={key} className="rounded-lg bg-white p-3">
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="font-medium text-neutral-700">{label}</span>
-                        <span className="text-neutral-500">{round2(cropParams[key])}</span>
-                      </div>
-                      <input
-                        type="range"
-                        min={min}
-                        max={max}
-                        step={0.005}
-                        value={cropParams[key]}
-                        onChange={(e) =>
-                          setCropParams((prev) => ({
-                            ...prev,
-                            [key]: parseFloat(e.target.value),
-                          }))
-                        }
-                        className="mt-2 w-full"
-                      />
-                    </div>
-                  ))}
-                </div>
-
-                <div className="mt-2 text-[11px] text-neutral-500">
-                  Tip: si ves solo 1 número (ej. 637) en el preview, baja “Chart top” un poco o sube “Labels bottom”.
-                </div>
-              </div>
-            )}
           </div>
 
-          {/* Assumptions */}
+          {/* Supuestos */}
           <div className="rounded-2xl border border-neutral-200 p-4 shadow-sm">
             <div className="text-lg font-semibold">Supuestos del sistema</div>
 
@@ -745,21 +803,6 @@ export default function Page() {
                   className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
                 />
               </div>
-
-              <div>
-                <div className="text-xs font-medium text-neutral-600">Techo</div>
-                <select
-                  value={roofType}
-                  onChange={(e) => setRoofType(e.target.value as any)}
-                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
-                >
-                  <option>Shingle</option>
-                  <option>Metal</option>
-                  <option>Concrete</option>
-                  <option>Other</option>
-                </select>
-              </div>
-
               <div>
                 <div className="text-xs font-medium text-neutral-600">Permisos (est.)</div>
                 <input
@@ -769,7 +812,6 @@ export default function Page() {
                   className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
                 />
               </div>
-
               <div>
                 <div className="text-xs font-medium text-neutral-600">Interconexión (est.)</div>
                 <input
@@ -779,7 +821,6 @@ export default function Page() {
                   className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
                 />
               </div>
-
               <div>
                 <div className="text-xs font-medium text-neutral-600">Misceláneo (%)</div>
                 <input
@@ -815,84 +856,73 @@ export default function Page() {
                 </div>
               </div>
             </div>
-          </div>
-        </div>
 
-        {/* Battery */}
-        <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
-          <div className="rounded-2xl border border-neutral-200 p-4 shadow-sm">
-            <div className="text-lg font-semibold">Batería</div>
-
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              <div>
-                <div className="text-xs font-medium text-neutral-600">Horas de respaldo</div>
-                <select
-                  value={backupHours}
-                  onChange={(e) => setBackupHours(parseFloat(e.target.value))}
-                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
-                >
-                  {[4, 6, 8, 10, 12].map((h) => (
-                    <option key={h} value={h}>
-                      {h} horas
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <div className="text-xs font-medium text-neutral-600">Cargas críticas (kW)</div>
-                <select
-                  value={criticalKw}
-                  onChange={(e) => setCriticalKw(parseFloat(e.target.value))}
-                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
-                >
-                  {[1, 1.5, 2, 3, 5].map((k) => (
-                    <option key={k} value={k}>
-                      {k} kW (típico)
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-neutral-200 p-4 shadow-sm">
-            <div className="text-lg font-semibold">Opciones de batería + precio final</div>
-            <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
-              {batteryCards.map((b) => (
-                <div
-                  key={b.kwh}
-                  className={`rounded-xl border p-3 ${
-                    b.isRecommended ? "border-emerald-300 bg-emerald-50" : "border-neutral-200 bg-white"
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="text-sm font-semibold">{b.kwh} kWh</div>
-                    {b.isRecommended ? (
-                      <span className="rounded-full bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white">
-                        Recomendado
-                      </span>
-                    ) : (
-                      <span className="text-[10px] text-neutral-500">Opción</span>
-                    )}
-                  </div>
-
-                  <div className="mt-2 text-xs text-neutral-700">
-                    Batería: {formatMoney(b.battCost)}{" "}
-                    <span className="text-neutral-500">(${SOLUNA_PRICE_PER_KWH}/kWh)</span>
-                  </div>
-                  <div className="text-xs text-neutral-700">Total (PV + batería): {formatMoney(b.total)}</div>
-                  <div className="mt-1 text-[11px] text-neutral-600">
-                    Horas est. a {criticalKw} kW: <span className="font-medium">{round2(b.estHours)} h</span>
-                  </div>
+            <div className="mt-5 rounded-xl border border-neutral-200 p-3">
+              <div className="text-sm font-semibold">Batería</div>
+              <div className="mt-3 grid grid-cols-2 gap-3">
+                <div>
+                  <div className="text-xs font-medium text-neutral-600">Horas de respaldo</div>
+                  <select
+                    value={backupHours}
+                    onChange={(e) => setBackupHours(parseFloat(e.target.value))}
+                    className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                  >
+                    {[4, 6, 8, 10, 12].map((h) => (
+                      <option key={h} value={h}>
+                        {h} horas
+                      </option>
+                    ))}
+                  </select>
                 </div>
-              ))}
+                <div>
+                  <div className="text-xs font-medium text-neutral-600">Cargas críticas (kW)</div>
+                  <select
+                    value={criticalKw}
+                    onChange={(e) => setCriticalKw(parseFloat(e.target.value))}
+                    className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                  >
+                    {[1, 1.5, 2, 3, 5].map((k) => (
+                      <option key={k} value={k}>
+                        {k} kW (típico)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {batteryCards.map((b) => (
+                  <div
+                    key={b.kwh}
+                    className={`rounded-xl border p-3 ${
+                      b.isRecommended ? "border-emerald-300 bg-emerald-50" : "border-neutral-200 bg-white"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm font-semibold">{b.kwh} kWh</div>
+                      {b.isRecommended ? (
+                        <span className="rounded-full bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white">
+                          Recomendado
+                        </span>
+                      ) : (
+                        <span className="text-[10px] text-neutral-500">Opción</span>
+                      )}
+                    </div>
+                    <div className="mt-2 text-xs text-neutral-700">Total (PV + batería): {formatMoney(b.total)}</div>
+                    <div className="mt-1 text-[11px] text-neutral-600">
+                      Horas est. a {criticalKw} kW: <span className="font-medium">{round2(b.estHours)} h</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-3 text-xs text-neutral-500">
+              Cómo se calcula consumo mensual desde la foto: se leen los numeritos arriba de las barras, se toman los{" "}
+              <span className="font-medium">12 más recientes</span>, se promedia (kWh/mes) y anual = promedio × 12. Si hay
+              menos de 12 meses disponibles, se usa lo que haya (mín. 4) y se extrapola a 12.
             </div>
           </div>
-        </div>
-
-        <div className="mt-8 text-xs text-neutral-500">
-          Si el OCR sigue fallando: la solución real es que el preview “Auto-crop (números)” muestre TODOS los numeritos
-          encima de las barras. Ajusta el recorte manual hasta lograrlo.
         </div>
       </div>
     </div>
