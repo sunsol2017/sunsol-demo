@@ -1,65 +1,47 @@
 "use client";
 
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * Sunsol - Cotizador (sin vendedor)
- * - Foto/screenshot de LUMA página 4 (CONSUMPTION HISTORY)
- * - Auto-crop a la zona de la gráfica (bottom portion)
- * - Si OCR falla => permite crop manual (usuario dibuja rectángulo)
- * - Extrae consumo mensual por meses (EN/ES), toma 12 más recientes
- * - Si faltan meses: anualiza con meses disponibles (min 4)
- * - PV $/W y Batería Soluna $/kWh, sin incentivos
+ * Sunsol – Cotizador (sin vendedor)
+ * OCR LUMA page 4 (Consumption History graph):
+ * - Auto-crop por defecto
+ * - Descarta eje Y por POSICIÓN (no por valores)
+ * - Considera SOLO números arriba de las barras (región superior del chart)
+ * - Usa los 12 más recientes (derecha a izquierda)
+ * - Si faltan meses: usa >=4 y estima anual = (sum/meses)*12
+ *
+ * Requisitos:
+ *   npm i tesseract.js
  */
 
-const PV_PRICE_PER_W_DEFAULT = 2.3;
-const SOLUNA_PRICE_PER_KWH = 350;
+const PV_PRICE_PER_W = 2.30; // $/W instalado (sin incentivos)
+const SOLUNA_PRICE_PER_KWH = 350; // $/kWh
 
-const DEFAULT_PSH = 5;
-const DEFAULT_LOSS_FACTOR = 0.8;
-const DEFAULT_OFFSET = 90;
-const DEFAULT_PANEL_W = 450;
+const BATTERY_SIZES = [5, 10, 16, 20, 32, 40] as const;
 
-const DEFAULT_PERMITS = 1200;
-const DEFAULT_INTERCONNECTION = 450;
-const DEFAULT_MISC_FACTOR = 0.03;
-
-const BATTERY_OPTIONS = [5, 10, 16, 20, 32, 40] as const;
-const BATTERY_USABLE_FACTOR = 0.9;
-
-// Para tu regla:
-const KWH_MIN = 20;
-const KWH_MAX = 3000;
-const MIN_MONTHS_REQUIRED = 4;
-
-type ParseResult = {
-  ok: boolean;
-  reason?: string;
-
-  monthsDetected?: string[]; // tokens de meses encontrados
-  monthlyValues?: number[]; // valores detectados (orden aproximado)
-  monthsUsedCount?: number;
-
-  annualKwh?: number;
-  monthlyAvgKwh?: number;
-
-  commercialFlag?: boolean; // si detectó >3000
+type OcrPick = {
+  value: number;
+  conf: number; // 0..100
+  x: number; // normalized 0..1
+  y: number; // normalized 0..1
 };
 
-// ===== OCR (tesseract.js) =====
-async function runOcr(blob: Blob): Promise<{ text: string; confidence: number }> {
-  const Tesseract = (await import("tesseract.js")).default;
-  const { data } = await Tesseract.recognize(blob, "eng", { logger: () => {} });
-  return {
-    text: String(data?.text || ""),
-    confidence: Number.isFinite(data?.confidence) ? (data.confidence as number) : 0,
-  };
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
 }
 
-// ===== Image helpers =====
-function loadImageFromBlob(blob: Blob): Promise<HTMLImageElement> {
+function formatMoney(n: number) {
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+}
+
+function round2(n: number) {
+  return Math.round(n * 100) / 100;
+}
+
+function loadImageFromFile(file: File): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
       URL.revokeObjectURL(url);
@@ -73,807 +55,701 @@ function loadImageFromBlob(blob: Blob): Promise<HTMLImageElement> {
   });
 }
 
+function canvasFromImage(img: HTMLImageElement, maxWidth = 1600): HTMLCanvasElement {
+  const c = document.createElement("canvas");
+  const scale = img.width > maxWidth ? maxWidth / img.width : 1;
+  c.width = Math.round(img.width * scale);
+  c.height = Math.round(img.height * scale);
+  const ctx = c.getContext("2d")!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, 0, 0, c.width, c.height);
+  return c;
+}
+
 /**
- * Auto-crop: recorta zona inferior donde suele estar "CONSUMPTION HISTORY".
- * Ajuste simple: y desde 45% hacia abajo (55% de alto).
+ * Auto-crop (robusto y simple):
+ * Asume que el usuario tomó la página completa 4.
+ * Recorta al área inferior donde está la gráfica.
+ * Luego recorta a "zona de números arriba de barras", y elimina eje Y por margen izquierdo.
  */
-async function autoCropLumaGraph(blob: Blob): Promise<Blob> {
-  const img = await loadImageFromBlob(blob);
+function autoCropToBarLabels(full: HTMLCanvasElement) {
+  const W = full.width;
+  const H = full.height;
 
-  const srcW = img.naturalWidth || img.width;
-  const srcH = img.naturalHeight || img.height;
+  // 1) Cropea a la mitad inferior donde suele estar "CONSUMPTION HISTORY"
+  //    (en LUMA page 4, la gráfica está en el tercio inferior)
+  const chartTop = Math.round(H * 0.50);
+  const chartBottom = Math.round(H * 0.93);
+  const chartLeft = Math.round(W * 0.04);
+  const chartRight = Math.round(W * 0.98);
 
-  const y = Math.floor(srcH * 0.45);
-  const h = Math.floor(srcH * 0.55);
-  const x = 0;
-  const w = srcW;
+  const chartW = Math.max(1, chartRight - chartLeft);
+  const chartH = Math.max(1, chartBottom - chartTop);
 
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("No canvas context");
-  ctx.drawImage(img, x, y, w, h, 0, 0, w, h);
+  const chart = document.createElement("canvas");
+  chart.width = chartW;
+  chart.height = chartH;
+  chart.getContext("2d")!.drawImage(full, chartLeft, chartTop, chartW, chartH, 0, 0, chartW, chartH);
 
-  return await new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (b) => {
-        if (!b) reject(new Error("No se pudo crear el recorte (blob)."));
-        else resolve(b);
-      },
-      "image/jpeg",
-      0.92
-    );
-  });
-}
+  // 2) Dentro del chart: mantener SOLO la banda superior donde están los numeritos encima de las barras.
+  //    Quitar parte inferior (labels de meses) y parte izquierda (eje Y)
+  const cw = chart.width;
+  const ch = chart.height;
 
-// ===== Parse: meses EN/ES + valores 20–3000 =====
-function normalizeText(t: string) {
-  return (t || "")
-    .replace(/\r/g, "\n")
-    .replace(/[|]/g, " ")
-    .replace(/[^\S\n]+/g, " ")
-    .trim();
-}
+  // Descarta eje Y por posición: quitamos un margen izquierdo fijo relativo.
+  const labelsLeft = Math.round(cw * 0.18); // <- elimina eje Y y numeración del eje
+  const labelsRight = Math.round(cw * 0.99);
 
-const MONTH_PATTERNS: { token: string; re: RegExp }[] = [
-  // Inglés
-  { token: "jan", re: /\bjan(?:uary)?\b/i },
-  { token: "feb", re: /\bfeb(?:ruary)?\b/i },
-  { token: "mar", re: /\bmar(?:ch)?\b/i },
-  { token: "apr", re: /\bapr(?:il)?\b/i },
-  { token: "may", re: /\bmay\b/i },
-  { token: "jun", re: /\bjun(?:e)?\b/i },
-  { token: "jul", re: /\bjul(?:y)?\b/i },
-  { token: "aug", re: /\baug(?:ust)?\b/i },
-  { token: "sep", re: /\bsep(?:tember)?\b/i },
-  { token: "oct", re: /\boct(?:ober)?\b/i },
-  { token: "nov", re: /\bnov(?:ember)?\b/i },
-  { token: "dec", re: /\bdec(?:ember)?\b/i },
+  // Banda vertical: parte superior/media donde aparecen los números de las barras.
+  // (evita meses de abajo y evita títulos arriba)
+  const labelsTop = Math.round(ch * 0.18);
+  const labelsBottom = Math.round(ch * 0.62);
 
-  // Español (abreviaturas comunes)
-  { token: "ene", re: /\bene(?:ro)?\b/i },
-  { token: "feb_es", re: /\bfeb(?:rero)?\b/i },
-  { token: "mar_es", re: /\bmar(?:zo)?\b/i },
-  { token: "abr", re: /\babr(?:il)?\b/i },
-  { token: "may_es", re: /\bmay(?:o)?\b/i },
-  { token: "jun_es", re: /\bjun(?:io)?\b/i },
-  { token: "jul_es", re: /\bjul(?:io)?\b/i },
-  { token: "ago", re: /\bago(?:sto)?\b/i },
-  { token: "sep_es", re: /\bsep(?:tiembre)?\b/i },
-  { token: "oct_es", re: /\boct(?:ubre)?\b/i },
-  { token: "nov_es", re: /\bnov(?:iembre)?\b/i },
-  { token: "dic", re: /\bdic(?:iembre)?\b/i },
+  const lw = Math.max(1, labelsRight - labelsLeft);
+  const lh = Math.max(1, labelsBottom - labelsTop);
 
-  // Formato tipo "Dec-24" / "Dic-24"
-  { token: "dec_dash", re: /\bdec[-/]\d{2}\b/i },
-  { token: "dic_dash", re: /\bdic[-/]\d{2}\b/i },
-];
+  const labels = document.createElement("canvas");
+  labels.width = lw;
+  labels.height = lh;
+  labels.getContext("2d")!.drawImage(chart, labelsLeft, labelsTop, lw, lh, 0, 0, lw, lh);
 
-function extractMonthsInOrder(block: string): string[] {
-  const lower = block.toLowerCase();
-  const hits: { idx: number; token: string }[] = [];
-
-  for (const p of MONTH_PATTERNS) {
-    // Buscar múltiples ocurrencias por regex (global)
-    const re = new RegExp(p.re.source, "ig");
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(lower)) !== null) {
-      hits.push({ idx: m.index, token: m[0].toLowerCase() });
-    }
-  }
-
-  hits.sort((a, b) => a.idx - b.idx);
-
-  // Deduplicar por token + orden (evita repetir "mar" etc)
-  const out: string[] = [];
-  for (const h of hits) {
-    const tok = h.token;
-    if (out.length === 0 || out[out.length - 1] !== tok) out.push(tok);
-  }
-  return out;
-}
-
-function extractConsumptionFromOcr(textRaw: string): ParseResult {
-  const text = normalizeText(textRaw);
-  const lower = text.toLowerCase();
-
-  // Enfocar a bloque de la gráfica si aparece el encabezado
-  const keyIdx =
-    lower.indexOf("consumption history") >= 0
-      ? lower.indexOf("consumption history")
-      : lower.indexOf("historial de consumo") >= 0
-        ? lower.indexOf("historial de consumo")
-        : lower.indexOf("consumptionhistory");
-
-  let block = text;
-  if (keyIdx >= 0) {
-    block = text.slice(keyIdx);
-  }
-
-  // Cortar antes de "Cost per kWh" si aparece
-  const endKeyIdx = block.toLowerCase().indexOf("cost per kwh");
-  if (endKeyIdx > 0) block = block.slice(0, endKeyIdx);
-
-  // Meses detectados (EN/ES)
-  const monthsDetected = extractMonthsInOrder(block);
-
-  // Extraer números candidatos
-  const nums = Array.from(block.matchAll(/\b(\d{2,4})\b/g))
-    .map((m) => Number(m[1]))
-    .filter((n) => Number.isFinite(n));
-
-  // Filtrar rango 20–3000
-  const candidates = nums.filter((n) => n >= KWH_MIN && n <= KWH_MAX);
-
-  // Si hay números fuera de rango alto (p.ej OCR leyó 8250), marcar posible comercial
-  const commercialFlag = nums.some((n) => n > KWH_MAX);
-
-  // Necesitamos señal de que estamos en el área correcta:
-  // Si no detecta meses y hay muy pocos candidatos, fallar.
-  if (monthsDetected.length < MIN_MONTHS_REQUIRED && candidates.length < MIN_MONTHS_REQUIRED) {
-    return {
-      ok: false,
-      reason: "No se detectaron meses suficientes ni valores claros en la gráfica. Usa página 4 completa y foto nítida.",
-      commercialFlag,
-    };
-  }
-
-  // Heurística de orden:
-  // En OCR, muchas veces los valores de barras aparecen juntos.
-  // Tomamos los últimos N valores donde N = min(13, max(meses_detectados, 13 si hay suficientes números)).
-  const targetN = Math.min(13, Math.max(monthsDetected.length, Math.min(13, candidates.length)));
-  let series = candidates.slice(-targetN);
-
-  // Limpiar: si hay 0 o muy pocos, fallo.
-  if (series.length < MIN_MONTHS_REQUIRED) {
-    return {
-      ok: false,
-      reason: `Solo pude extraer ${series.length} mes(es). Se requieren mínimo ${MIN_MONTHS_REQUIRED}.`,
-      monthsDetected,
-      monthlyValues: series,
-      commercialFlag,
-    };
-  }
-
-  // Regla: usar 12 más recientes si hay 12+
-  let used: number[] = [];
-  if (series.length >= 12) {
-    used = series.slice(-12);
-  } else {
-    used = series; // 4–11 meses
-  }
-
-  const sum = used.reduce((a, b) => a + b, 0);
-  const monthsUsedCount = used.length;
-
-  // Si hay 12 meses => anual real = suma
-  // Si hay 4–11 => anualizar
-  const annualKwh = monthsUsedCount >= 12 ? sum : (sum / monthsUsedCount) * 12;
-  const monthlyAvgKwh = annualKwh / 12;
-
+  // Para debug/preview también devolvemos el chart completo recortado
   return {
-    ok: true,
-    monthsDetected,
-    monthlyValues: series,
-    monthsUsedCount,
-    annualKwh,
-    monthlyAvgKwh,
-    commercialFlag,
+    chartCanvas: chart,
+    labelsCanvas: labels,
+    meta: {
+      full: { W, H },
+      chartCrop: { x: chartLeft, y: chartTop, w: chartW, h: chartH },
+      labelsCropWithinChart: { x: labelsLeft, y: labelsTop, w: lw, h: lh },
+      margins: { leftPct: 0.18, topPct: 0.18, bottomPct: 0.62 },
+    },
   };
 }
 
-// ===== PV sizing =====
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
+function canvasToDataUrl(c: HTMLCanvasElement, quality = 0.92) {
+  return c.toDataURL("image/jpeg", quality);
 }
 
-function pvKwFromMonthlyKwh(monthlyKwh: number, psh: number, lossFactor: number, offsetPct: number) {
-  const offset = clamp(offsetPct, 0, 100) / 100;
-  const denom = Math.max(0.1, psh) * 30 * Math.max(0.1, lossFactor);
-  return (monthlyKwh * offset) / denom;
-}
+/**
+ * OCR sólo de números (arriba de barras).
+ * Importantísimo: usamos bbox/posición para descartar eje Y (ya viene recortado),
+ * y para ordenar por X y tomar los 12 más recientes.
+ */
+async function runOcrOnCanvasNumbersOnly(labelsCanvas: HTMLCanvasElement) {
+  // dynamic import para evitar problemas SSR/build
+  const tesseract = await import("tesseract.js");
 
-function formatMoney(n: number) {
-  return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
-}
+  // createWorker es más estable; fallback a recognize simple si no existe
+  const createWorker = (tesseract as any).createWorker as undefined | (() => any);
 
-function formatNumber(n: number, digits = 0) {
-  return n.toLocaleString("en-US", { maximumFractionDigits: digits });
-}
+  const imgDataUrl = canvasToDataUrl(labelsCanvas);
 
-// ===== Manual Crop Modal (simple: dibuja rectángulo sobre canvas) =====
-type CropRect = { x: number; y: number; w: number; h: number };
-
-function CropModal({
-  open,
-  imageBlob,
-  onCancel,
-  onConfirm,
-}: {
-  open: boolean;
-  imageBlob: Blob | null;
-  onCancel: () => void;
-  onConfirm: (cropped: Blob) => void;
-}) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [imgEl, setImgEl] = useState<HTMLImageElement | null>(null);
-  const [rect, setRect] = useState<CropRect | null>(null);
-  const dragRef = useRef<{ dragging: boolean; startX: number; startY: number } | null>(null);
-
-  React.useEffect(() => {
-    if (!open || !imageBlob) return;
-
-    (async () => {
-      const img = await loadImageFromBlob(imageBlob);
-      setImgEl(img);
-
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      // Ajustar canvas a un ancho manejable
-      const maxW = 900;
-      const scale = Math.min(1, maxW / img.width);
-      canvas.width = Math.floor(img.width * scale);
-      canvas.height = Math.floor(img.height * scale);
-
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-      // Rect default: zona inferior (similar auto-crop)
-      const defaultRect: CropRect = {
-        x: 0,
-        y: Math.floor(canvas.height * 0.45),
-        w: canvas.width,
-        h: Math.floor(canvas.height * 0.55),
-      };
-      setRect(defaultRect);
-      drawRect(ctx, defaultRect);
-    })();
-  }, [open, imageBlob]);
-
-  function draw() {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    if (!canvas || !ctx || !imgEl) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(imgEl, 0, 0, canvas.width, canvas.height);
-    if (rect) drawRect(ctx, rect);
-  }
-
-  function drawRect(ctx: CanvasRenderingContext2D, r: CropRect) {
-    ctx.save();
-    ctx.strokeStyle = "#00a77a";
-    ctx.lineWidth = 3;
-    ctx.fillStyle = "rgba(0,167,122,0.12)";
-    ctx.fillRect(r.x, r.y, r.w, r.h);
-    ctx.strokeRect(r.x, r.y, r.w, r.h);
-    ctx.restore();
-  }
-
-  function getPos(e: React.MouseEvent<HTMLCanvasElement, MouseEvent>) {
-    const canvas = canvasRef.current!;
-    const r = canvas.getBoundingClientRect();
-    const x = e.clientX - r.left;
-    const y = e.clientY - r.top;
-    return { x, y };
-  }
-
-  function onDown(e: React.MouseEvent<HTMLCanvasElement, MouseEvent>) {
-    if (!canvasRef.current) return;
-    const { x, y } = getPos(e);
-    dragRef.current = { dragging: true, startX: x, startY: y };
-    setRect({ x, y, w: 1, h: 1 });
-  }
-
-  function onMove(e: React.MouseEvent<HTMLCanvasElement, MouseEvent>) {
-    if (!dragRef.current?.dragging) return;
-    const { x, y } = getPos(e);
-    const sx = dragRef.current.startX;
-    const sy = dragRef.current.startY;
-
-    const nx = Math.min(sx, x);
-    const ny = Math.min(sy, y);
-    const nw = Math.abs(x - sx);
-    const nh = Math.abs(y - sy);
-
-    setRect({ x: nx, y: ny, w: Math.max(1, nw), h: Math.max(1, nh) });
-    requestAnimationFrame(draw);
-  }
-
-  function onUp() {
-    if (dragRef.current) dragRef.current.dragging = false;
-    requestAnimationFrame(draw);
-  }
-
-  async function confirmCrop() {
-    if (!imageBlob || !imgEl || !rect || !canvasRef.current) return;
-
-    // Convertir rect canvas -> rect en imagen original (considerando escala)
-    const canvas = canvasRef.current;
-    const scaleX = imgEl.width / canvas.width;
-    const scaleY = imgEl.height / canvas.height;
-
-    const sx = Math.floor(rect.x * scaleX);
-    const sy = Math.floor(rect.y * scaleY);
-    const sw = Math.floor(rect.w * scaleX);
-    const sh = Math.floor(rect.h * scaleY);
-
-    const outCanvas = document.createElement("canvas");
-    outCanvas.width = sw;
-    outCanvas.height = sh;
-    const ctx = outCanvas.getContext("2d");
-    if (!ctx) return;
-
-    ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, sw, sh);
-
-    const outBlob = await new Promise<Blob>((resolve, reject) => {
-      outCanvas.toBlob(
-        (b) => {
-          if (!b) reject(new Error("No se pudo generar recorte."));
-          else resolve(b);
-        },
-        "image/jpeg",
-        0.92
-      );
+  let data: any;
+  if (createWorker) {
+    const worker = await createWorker();
+    await worker.loadLanguage("eng");
+    await worker.initialize("eng");
+    await worker.setParameters({
+      tessedit_char_whitelist: "0123456789",
+      // PSM 6: block of text; PSM 11: sparse text. 6 suele ir bien para numeritos.
+      tessedit_pageseg_mode: "6",
     });
-
-    onConfirm(outBlob);
+    const res = await worker.recognize(imgDataUrl);
+    data = res.data;
+    await worker.terminate();
+  } else {
+    const res = await (tesseract as any).recognize(imgDataUrl, "eng", {
+      tessedit_char_whitelist: "0123456789",
+    });
+    data = res.data;
   }
 
-  if (!open) return null;
+  const W = labelsCanvas.width;
+  const H = labelsCanvas.height;
 
-  return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.55)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 14,
-        zIndex: 9999,
-      }}
-    >
-      <div style={{ background: "white", borderRadius: 14, maxWidth: 980, width: "100%", padding: 12 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-          <b>Recortar manualmente</b>
-          <button onClick={onCancel} style={{ border: "1px solid #ddd", background: "white", borderRadius: 10, padding: "8px 10px" }}>
-            Cerrar
-          </button>
-        </div>
+  const words = (data?.words ?? []) as Array<{
+    text: string;
+    confidence: number; // 0..100
+    bbox: { x0: number; y0: number; x1: number; y1: number };
+  }>;
 
-        <div style={{ marginTop: 10, color: "#666", fontSize: 13 }}>
-          Arrastra para dibujar un rectángulo sobre la <b>gráfica</b> (CONSUMPTION HISTORY). Luego presiona “Usar recorte”.
-        </div>
+  // Extrae candidatos numéricos por bbox.
+  const picks: OcrPick[] = [];
+  for (const w of words) {
+    const raw = (w.text ?? "").trim();
+    if (!raw) continue;
 
-        <div style={{ marginTop: 10, overflow: "auto", border: "1px solid #eee", borderRadius: 12 }}>
-          <canvas
-            ref={canvasRef}
-            onMouseDown={onDown}
-            onMouseMove={onMove}
-            onMouseUp={onUp}
-            onMouseLeave={onUp}
-            style={{ width: "100%", height: "auto", display: "block", cursor: "crosshair" }}
-          />
-        </div>
+    // A veces viene como "825." o "825," → limpiamos no-dígitos
+    const cleaned = raw.replace(/[^\d]/g, "");
+    if (!cleaned) continue;
+    if (cleaned.length > 4) continue; // evita basura enorme
+    const val = parseInt(cleaned, 10);
+    if (!Number.isFinite(val)) continue;
 
-        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 12 }}>
-          <button onClick={onCancel} style={{ border: "1px solid #ddd", background: "white", borderRadius: 10, padding: "10px 12px" }}>
-            Cancelar
-          </button>
-          <button onClick={confirmCrop} style={{ border: "1px solid #00a77a", background: "#00a77a", color: "white", borderRadius: 10, padding: "10px 12px" }}>
-            Usar recorte
-          </button>
-        </div>
-      </div>
-    </div>
-  );
+    // rango residencial típico, con límite comercial
+    if (val < 20 || val > 3000) continue;
+
+    const bb = w.bbox;
+    const cx = (bb.x0 + bb.x1) / 2;
+    const cy = (bb.y0 + bb.y1) / 2;
+
+    // SOLO zona superior del recorte (números encima de barras)
+    // (labelsCanvas ya es una banda, pero aún así filtramos por Y para evitar cualquier ruido)
+    const yNorm = cy / H;
+    if (yNorm < 0.02 || yNorm > 0.98) continue;
+
+    // Filtra tokens demasiado pequeños (ruido)
+    const bw = Math.max(1, bb.x1 - bb.x0);
+    const bh = Math.max(1, bb.y1 - bb.y0);
+    if (bw < 6 || bh < 10) continue;
+
+    picks.push({
+      value: val,
+      conf: w.confidence ?? 0,
+      x: cx / W,
+      y: cy / H,
+    });
+  }
+
+  // Dedup: si el OCR detecta el mismo número muy cerca, se queda el de mayor confianza
+  // Agrupamos por cercanía en X (porque hay 12-13 barras).
+  const sortedByX = [...picks].sort((a, b) => a.x - b.x);
+
+  const merged: OcrPick[] = [];
+  const MERGE_X = 0.035; // ~3.5% del ancho; ajusta si hace falta
+
+  for (const p of sortedByX) {
+    const last = merged[merged.length - 1];
+    if (!last) {
+      merged.push(p);
+      continue;
+    }
+    if (Math.abs(p.x - last.x) <= MERGE_X) {
+      // mismo “slot” de barra → conserva el más confiable
+      if (p.conf > last.conf) merged[merged.length - 1] = p;
+    } else {
+      merged.push(p);
+    }
+  }
+
+  // Usa los 12 más recientes: toma los 12 más a la derecha
+  const last12 = merged.length > 12 ? merged.slice(merged.length - 12) : merged;
+
+  const values = last12.map((p) => p.value);
+  const sum = values.reduce((a, b) => a + b, 0);
+  const monthsUsed = values.length;
+
+  return {
+    picksAll: merged,
+    picksUsed: last12,
+    valuesUsed: values,
+    monthsUsed,
+    annualEstimated: monthsUsed >= 1 ? (sum / monthsUsed) * 12 : 0,
+    monthlyAverage: monthsUsed >= 1 ? sum / monthsUsed : 0,
+    avgConfidence: last12.length
+      ? last12.reduce((a, b) => a + b.conf, 0) / last12.length
+      : 0,
+  };
 }
 
-// ===== Main Page =====
 export default function Page() {
-  // Inputs
-  const [monthlyKwh, setMonthlyKwh] = useState<number>(0);
-  const [annualKwh, setAnnualKwh] = useState<number>(0);
-  const [monthsUsedCount, setMonthsUsedCount] = useState<number>(0);
+  // Upload + preview
+  const cameraInputRef = useRef<HTMLInputElement | null>(null);
+  const galleryInputRef = useRef<HTMLInputElement | null>(null);
 
-  const [offsetPct, setOffsetPct] = useState<number>(DEFAULT_OFFSET);
-  const [psh, setPsh] = useState<number>(DEFAULT_PSH);
-  const [lossFactor, setLossFactor] = useState<number>(DEFAULT_LOSS_FACTOR);
-  const [panelW, setPanelW] = useState<number>(DEFAULT_PANEL_W);
-  const [pricePerW, setPricePerW] = useState<number>(PV_PRICE_PER_W_DEFAULT);
+  const [rawImageUrl, setRawImageUrl] = useState<string | null>(null);
+  const [previewChartUrl, setPreviewChartUrl] = useState<string | null>(null);
+  const [previewLabelsUrl, setPreviewLabelsUrl] = useState<string | null>(null);
 
-  const [permits, setPermits] = useState<number>(DEFAULT_PERMITS);
-  const [interconnection, setInterconnection] = useState<number>(DEFAULT_INTERCONNECTION);
-  const [miscFactor, setMiscFactor] = useState<number>(DEFAULT_MISC_FACTOR);
-
-  // Battery sizing
-  const [criticalKw, setCriticalKw] = useState<number>(1.5);
-  const [backupHours, setBackupHours] = useState<number>(8);
-
-  // OCR UI
+  // OCR results
   const [ocrBusy, setOcrBusy] = useState(false);
-  const [ocrConfidence, setOcrConfidence] = useState<number | null>(null);
-  const [ocrMsg, setOcrMsg] = useState<string>("");
-  const [previewUrl, setPreviewUrl] = useState<string>("");
+  const [ocrError, setOcrError] = useState<string | null>(null);
+  const [ocrMonthlyAvg, setOcrMonthlyAvg] = useState<number>(0);
+  const [ocrAnnual, setOcrAnnual] = useState<number>(0);
+  const [ocrMonthsUsed, setOcrMonthsUsed] = useState<number>(0);
+  const [ocrConfidence, setOcrConfidence] = useState<number>(0);
+  const [ocrValuesDebug, setOcrValuesDebug] = useState<number[]>([]);
 
-  const [rawDetectedValues, setRawDetectedValues] = useState<number[] | null>(null);
-  const [commercialFlag, setCommercialFlag] = useState<boolean>(false);
+  // Manual override: monthly kWh
+  const [monthlyKwh, setMonthlyKwh] = useState<number>(0);
 
-  const [lastFileBlob, setLastFileBlob] = useState<Blob | null>(null);
-  const [showManualCrop, setShowManualCrop] = useState(false);
-  const [allowManualCrop, setAllowManualCrop] = useState(false);
+  // Assumptions / knobs
+  const [offsetPct, setOffsetPct] = useState<number>(90);
+  const [psh, setPsh] = useState<number>(5);
+  const [lossFactor, setLossFactor] = useState<number>(0.8);
+  const [panelW, setPanelW] = useState<number>(450);
 
-  const fileInputCameraRef = useRef<HTMLInputElement | null>(null);
-  const fileInputGalleryRef = useRef<HTMLInputElement | null>(null);
+  // simple adders (editable)
+  const [roofType, setRoofType] = useState<"Shingle" | "Metal" | "Concrete" | "Other">("Shingle");
+  const [permits, setPermits] = useState<number>(1200);
+  const [interconnection, setInterconnection] = useState<number>(450);
+  const [miscPct, setMiscPct] = useState<number>(3);
 
-  function resetOcrOutputs() {
-    setOcrConfidence(null);
-    setOcrMsg("");
-    setRawDetectedValues(null);
-    setCommercialFlag(false);
-    setAllowManualCrop(false);
-  }
+  // Battery assumptions
+  const [backupHours, setBackupHours] = useState<number>(8);
+  const [criticalKw, setCriticalKw] = useState<number>(1.5);
 
-  async function runPipelineOnBlob(originalBlob: Blob, mode: "auto" | "manual") {
+  // Sync manual monthly kWh with OCR avg when OCR updates (but allow user override)
+  useEffect(() => {
+    if (ocrMonthlyAvg > 0) setMonthlyKwh(round2(ocrMonthlyAvg));
+  }, [ocrMonthlyAvg]);
+
+  const roofAdderCost = useMemo(() => {
+    // placeholder adder; ajusta después
+    if (roofType === "Shingle") return 0;
+    if (roofType === "Metal") return 800;
+    if (roofType === "Concrete") return 1500;
+    return 500;
+  }, [roofType]);
+
+  const monthlyForSizing = useMemo(() => {
+    return Math.max(0, monthlyKwh || 0);
+  }, [monthlyKwh]);
+
+  const pvKwRecommended = useMemo(() => {
+    // kWh/month needed = monthly * offset
+    const targetMonthly = monthlyForSizing * (offsetPct / 100);
+    const kwhPerKwMonth = Math.max(0.1, psh * 30 * lossFactor);
+    const kw = targetMonthly / kwhPerKwMonth;
+    return kw;
+  }, [monthlyForSizing, offsetPct, psh, lossFactor]);
+
+  const pvWattsRecommended = useMemo(() => pvKwRecommended * 1000, [pvKwRecommended]);
+
+  const panelsCount = useMemo(() => {
+    if (!panelW) return 0;
+    return Math.ceil(pvWattsRecommended / panelW);
+  }, [pvWattsRecommended, panelW]);
+
+  const basePvCost = useMemo(() => {
+    const pvCost = pvWattsRecommended * PV_PRICE_PER_W;
+    const misc = (pvCost * miscPct) / 100;
+    return pvCost + misc + roofAdderCost + permits + interconnection;
+  }, [pvWattsRecommended, miscPct, roofAdderCost, permits, interconnection]);
+
+  const batteryCards = useMemo(() => {
+    // Recomendación por respaldo (kWh nominal) considerando factor usable
+    const usableFactor = 0.9; // típico
+    const requiredKwhNominal = (criticalKw * backupHours) / usableFactor;
+
+    // Ordena opciones: primero la que cubre, luego las demás
+    const sorted = [...BATTERY_SIZES].sort((a, b) => a - b);
+    const recommended = sorted.find((k) => k >= requiredKwhNominal) ?? sorted[sorted.length - 1];
+
+    // muestra todas
+    return sorted.map((kwh) => {
+      const battCost = kwh * SOLUNA_PRICE_PER_KWH;
+      const total = basePvCost + battCost;
+      const estHours = (kwh * usableFactor) / Math.max(0.5, criticalKw);
+      return {
+        kwh,
+        battCost,
+        total,
+        estHours,
+        isRecommended: kwh === recommended,
+        requiredKwhNominal,
+      };
+    });
+  }, [basePvCost, backupHours, criticalKw]);
+
+  async function handleFile(file: File) {
+    setOcrError(null);
+    setOcrValuesDebug([]);
+    setOcrMonthsUsed(0);
+    setOcrConfidence(0);
+    setOcrAnnual(0);
+    setOcrMonthlyAvg(0);
+
+    const img = await loadImageFromFile(file);
+    const fullCanvas = canvasFromImage(img, 1600);
+    const fullUrl = canvasToDataUrl(fullCanvas);
+    setRawImageUrl(fullUrl);
+
+    const { chartCanvas, labelsCanvas } = autoCropToBarLabels(fullCanvas);
+    setPreviewChartUrl(canvasToDataUrl(chartCanvas));
+    setPreviewLabelsUrl(canvasToDataUrl(labelsCanvas));
+
     setOcrBusy(true);
-    setAllowManualCrop(false);
-    setOcrMsg(mode === "auto" ? "Procesando OCR (auto-crop)..." : "Procesando OCR (recorte manual)...");
-
     try {
-      const blobToOcr = mode === "auto" ? await autoCropLumaGraph(originalBlob) : originalBlob;
-      const { text, confidence } = await runOcr(blobToOcr);
-      setOcrConfidence(confidence);
+      const r = await runOcrOnCanvasNumbersOnly(labelsCanvas);
 
-      const parsed = extractConsumptionFromOcr(text);
-      setCommercialFlag(Boolean(parsed.commercialFlag));
+      setOcrValuesDebug(r.picksAll.map((p) => p.value));
+      setOcrMonthsUsed(r.monthsUsed);
+      setOcrConfidence(r.avgConfidence);
 
-      if (parsed.ok && parsed.annualKwh && parsed.monthlyAvgKwh) {
-        setAnnualKwh(Number(parsed.annualKwh.toFixed(0)));
-        setMonthlyKwh(Number(parsed.monthlyAvgKwh.toFixed(2)));
-        setMonthsUsedCount(parsed.monthsUsedCount || 0);
-        setRawDetectedValues(parsed.monthlyValues || null);
-
-        const used = parsed.monthsUsedCount || 0;
-        const noteAnnual =
-          used >= 12 ? "Anual (12m real)" : `Anual estimado (usando ${used} mes(es) y anualizando)`;
-
-        setOcrMsg(
-          `OK. ${noteAnnual}: ${formatNumber(parsed.annualKwh, 0)} kWh. Promedio mensual: ${formatNumber(parsed.monthlyAvgKwh, 2)} kWh.`
-        );
+      // Regla: mínimo 4 meses para estimar anual
+      if (r.monthsUsed >= 4) {
+        setOcrAnnual(round2(r.annualEstimated));
+        setOcrMonthlyAvg(round2(r.monthlyAverage));
       } else {
-        setOcrMsg(`No pude leer la gráfica. ${parsed.reason || ""}`.trim());
-        // Habilitar manual crop solo si falló el auto
-        if (mode === "auto") setAllowManualCrop(true);
+        setOcrError("OCR insuficiente: se detectaron menos de 4 meses. Usa “Recortar” (manual) o escribe el kWh mensual.");
       }
     } catch (e: any) {
-      setOcrMsg(`Error OCR: ${String(e?.message || e)}`);
-      if (mode === "auto") setAllowManualCrop(true);
+      setOcrError(e?.message ?? "Error de OCR");
     } finally {
       setOcrBusy(false);
     }
   }
 
-  async function handleFile(file?: File | null) {
-    if (!file) return;
-
-    resetOcrOutputs();
-
-    const url = URL.createObjectURL(file);
-    setPreviewUrl(url);
-    setLastFileBlob(file);
-
-    await runPipelineOnBlob(file, "auto");
+  function onPickCamera() {
+    cameraInputRef.current?.click();
+  }
+  function onPickGallery() {
+    galleryInputRef.current?.click();
   }
 
-  // PV results
-  const pvKw = useMemo(() => pvKwFromMonthlyKwh(monthlyKwh, psh, lossFactor, offsetPct), [
-    monthlyKwh,
-    psh,
-    lossFactor,
-    offsetPct,
-  ]);
-
-  const panelCount = useMemo(() => {
-    const w = Math.max(1, panelW);
-    return Math.ceil((pvKw * 1000) / w);
-  }, [pvKw, panelW]);
-
-  const basePvCost = useMemo(() => pvKw * 1000 * pricePerW, [pvKw, pricePerW]);
-  const roofAdderCost = 0;
-  const miscCost = useMemo(() => (basePvCost + roofAdderCost + permits + interconnection) * miscFactor, [
-    basePvCost,
-    roofAdderCost,
-    permits,
-    interconnection,
-    miscFactor,
-  ]);
-
-  const pvTotalNoBattery = useMemo(
-    () => basePvCost + roofAdderCost + permits + interconnection + miscCost,
-    [basePvCost, roofAdderCost, permits, interconnection, miscCost]
-  );
-
-  // Battery recommendations
-  const recommendedBatteryKwh = useMemo(() => {
-    const needed = (criticalKw * backupHours) / BATTERY_USABLE_FACTOR;
-    for (const kwh of BATTERY_OPTIONS) {
-      if (kwh >= needed) return kwh;
-    }
-    return BATTERY_OPTIONS[BATTERY_OPTIONS.length - 1];
-  }, [criticalKw, backupHours]);
-
-  const batteryCards = useMemo(() => {
-    const unique = Array.from(new Set([recommendedBatteryKwh, ...BATTERY_OPTIONS])).sort((a, b) => a - b);
-    return unique.map((kwh) => {
-      const battCost = kwh * SOLUNA_PRICE_PER_KWH;
-      const total = pvTotalNoBattery + battCost;
-      const estHours = (kwh * BATTERY_USABLE_FACTOR) / Math.max(0.5, criticalKw);
-      return { kwh, battCost, total, estHours };
-    });
-  }, [recommendedBatteryKwh, pvTotalNoBattery, criticalKw]);
-
   return (
-    <main style={{ maxWidth: 980, margin: "0 auto", padding: 16, fontFamily: "system-ui, Arial" }}>
-      <h1 style={{ fontSize: 22, marginBottom: 4 }}>Sunsol • Cotizador (sin vendedor)</h1>
-      <div style={{ color: "#555", marginBottom: 16 }}>
-        PV: ${pricePerW.toFixed(2)}/W • Batería Soluna: ${SOLUNA_PRICE_PER_KWH}/kWh • Sin incentivos
-      </div>
-
-      {/* Uploader */}
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 16 }}>
-        <h2 style={{ fontSize: 16, marginTop: 0 }}>Foto / Screenshot de LUMA (página 4)</h2>
-
-        <div style={{ color: "#666", fontSize: 13, marginBottom: 10 }}>
-          <b>Instrucciones:</b> Usa la <b>página 4</b> de LUMA donde aparece la gráfica{" "}
-          <b>“CONSUMPTION HISTORY (KWH)”</b> (o “Historial de consumo”). Toma la foto <b>completa</b> de la página (sin recortar),
-          nítida y sin reflejos.
-        </div>
-
-        {/* Ejemplo (opcional). Coloca un archivo en /public/luma-example.png */}
-        <div style={{ marginBottom: 12 }}>
-          <div style={{ fontSize: 12, color: "#666", marginBottom: 6 }}>Ejemplo:</div>
-          <img
-            src="/luma-example.png"
-            alt="Ejemplo LUMA página 4"
-            style={{ width: "100%", maxHeight: 320, objectFit: "contain", borderRadius: 12, border: "1px solid #eee" }}
-            onError={(e) => {
-              // si no existe, no rompas UI
-              (e.currentTarget as HTMLImageElement).style.display = "none";
-            }}
-          />
-        </div>
-
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-          <button
-            onClick={() => fileInputCameraRef.current?.click()}
-            disabled={ocrBusy}
-            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white" }}
-          >
-            📷 Tomar foto
-          </button>
-          <button
-            onClick={() => fileInputGalleryRef.current?.click()}
-            disabled={ocrBusy}
-            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white" }}
-          >
-            🖼️ Subir de galería
-          </button>
-
-          {allowManualCrop && lastFileBlob && (
-            <button
-              onClick={() => setShowManualCrop(true)}
-              disabled={ocrBusy}
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #00a77a", background: "#00a77a", color: "white" }}
-            >
-              ✂️ Recortar (manual)
-            </button>
-          )}
-        </div>
-
-        {/* hidden inputs */}
-        <input
-          ref={fileInputCameraRef}
-          type="file"
-          accept="image/*"
-          capture="environment"
-          style={{ display: "none" }}
-          onChange={(e) => handleFile(e.target.files?.[0] || null)}
-        />
-        <input
-          ref={fileInputGalleryRef}
-          type="file"
-          accept="image/*"
-          style={{ display: "none" }}
-          onChange={(e) => handleFile(e.target.files?.[0] || null)}
-        />
-
-        <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-          <div>
-            <label style={{ fontSize: 12, color: "#666" }}>Consumo mensual promedio (kWh/mes)</label>
-            <input
-              value={monthlyKwh || ""}
-              onChange={(e) => setMonthlyKwh(Number(e.target.value || 0))}
-              inputMode="decimal"
-              style={{
-                width: "100%",
-                padding: 10,
-                borderRadius: 10,
-                border: "1px solid #ddd",
-                fontSize: 16,
-              }}
-            />
-            <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
-              Si el OCR falla, escribe el promedio mensual aquí.
-            </div>
-
-            <div style={{ marginTop: 10, fontSize: 13 }}>
-              <b>Consumo anual:</b> {annualKwh ? `${formatNumber(annualKwh)} kWh` : "—"}
-              {monthsUsedCount > 0 && (
-                <span style={{ color: "#666" }}>
-                  {" "}
-                  (usó {monthsUsedCount} mes(es){monthsUsedCount >= 12 ? "" : ", anualizado"})
-                </span>
-              )}
-            </div>
-
-            {ocrConfidence !== null && (
-              <div style={{ marginTop: 6, fontSize: 12, color: "#666" }}>OCR confianza: {ocrConfidence.toFixed(1)}%</div>
-            )}
-
-            {commercialFlag && (
-              <div style={{ marginTop: 8, fontSize: 13, color: "#b45309" }}>
-                ⚠️ Detecté valores fuera de rango (&gt; {KWH_MAX}). Posible caso comercial: requiere otro estimado.
-              </div>
-            )}
-
-            {ocrMsg && (
-              <div style={{ marginTop: 8, fontSize: 13, color: ocrMsg.startsWith("OK") ? "#0a7" : "#a00" }}>{ocrMsg}</div>
-            )}
+    <div className="min-h-screen bg-white text-neutral-900">
+      <div className="mx-auto max-w-5xl px-4 py-6">
+        <div className="flex flex-col gap-2">
+          <div className="text-2xl font-semibold">Sunsol · Cotizador (sin vendedor)</div>
+          <div className="text-sm text-neutral-600">
+            PV: ${PV_PRICE_PER_W.toFixed(2)}/W · Batería Soluna: ${SOLUNA_PRICE_PER_KWH}/kWh · Sin incentivos
           </div>
+          <div className="text-xs text-neutral-500">
+            Estimado preliminar. Validación final requiere inspección.
+          </div>
+        </div>
 
-          <div>
-            {previewUrl ? (
-              <div>
-                <div style={{ fontSize: 12, color: "#666", marginBottom: 6 }}>Preview</div>
-                <img
-                  src={previewUrl}
-                  alt="preview"
-                  style={{ width: "100%", borderRadius: 12, border: "1px solid #eee" }}
+        <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
+          {/* Uploader */}
+          <div className="rounded-2xl border border-neutral-200 p-4 shadow-sm">
+            <div className="text-lg font-semibold">Foto / Screenshot de LUMA (página 4)</div>
+            <div className="mt-2 text-sm text-neutral-600">
+              Instrucciones: Usa la página 4 de LUMA donde aparece la gráfica{" "}
+              <span className="font-medium">“CONSUMPTION HISTORY (KWH)”</span> (o “Historial de consumo”).
+              Toma la foto <span className="font-medium">completa</span>, nítida y sin reflejos.
+            </div>
+
+            <div className="mt-4 flex flex-col gap-3">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={onPickCamera}
+                  className="rounded-xl bg-black px-4 py-2 text-sm font-medium text-white"
+                >
+                  📷 Tomar foto
+                </button>
+                <button
+                  type="button"
+                  onClick={onPickGallery}
+                  className="rounded-xl border border-neutral-300 bg-white px-4 py-2 text-sm font-medium"
+                >
+                  🖼️ Subir de galería
+                </button>
+
+                {/* Inputs ocultos */}
+                <input
+                  ref={cameraInputRef}
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const f = e.target.files?.[0];
+                    if (f) await handleFile(f);
+                    e.currentTarget.value = "";
+                  }}
+                />
+                <input
+                  ref={galleryInputRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const f = e.target.files?.[0];
+                    if (f) await handleFile(f);
+                    e.currentTarget.value = "";
+                  }}
                 />
               </div>
-            ) : (
-              <div style={{ color: "#888", fontSize: 13, border: "1px dashed #ddd", borderRadius: 12, padding: 16 }}>
-                No hay imagen todavía.
-              </div>
-            )}
-          </div>
-        </div>
 
-        {rawDetectedValues && (
-          <div style={{ marginTop: 12, fontSize: 12, color: "#666" }}>
-            Valores detectados (orden OCR aprox): {rawDetectedValues.join(", ")}
-          </div>
-        )}
-      </section>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className="rounded-xl border border-neutral-200 p-3">
+                  <div className="text-xs font-medium text-neutral-600">Consumo mensual promedio (kWh/mes)</div>
+                  <input
+                    value={monthlyKwh || ""}
+                    onChange={(e) => setMonthlyKwh(parseFloat(e.target.value || "0"))}
+                    inputMode="decimal"
+                    placeholder="Ej. 600"
+                    className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                  />
+                  <div className="mt-2 text-xs text-neutral-500">Si el OCR falla, escribe el promedio mensual aquí.</div>
 
-      {/* Supuestos */}
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 16 }}>
-        <h2 style={{ fontSize: 16, marginTop: 0 }}>Supuestos del sistema</h2>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(220px, 1fr))", gap: 12 }}>
-          <Field label="Offset (%)" value={offsetPct} onChange={setOffsetPct} />
-          <Field label="PSH" value={psh} onChange={setPsh} />
-          <Field label="Pérdidas (factor)" value={lossFactor} onChange={setLossFactor} step="0.01" />
-          <Field label="Panel (W)" value={panelW} onChange={setPanelW} />
-          <Field label="Permisos (est.)" value={permits} onChange={setPermits} />
-          <Field label="Interconexión (est.)" value={interconnection} onChange={setInterconnection} />
-          <Field label="Precio instalado ($/W)" value={pricePerW} onChange={setPricePerW} step="0.01" />
-          <Field label="Misceláneo (factor)" value={miscFactor} onChange={setMiscFactor} step="0.01" />
-        </div>
-      </section>
+                  <div className="mt-3 text-xs text-neutral-700">
+                    {ocrBusy ? (
+                      <span className="text-neutral-500">Procesando OCR…</span>
+                    ) : (
+                      <>
+                        <div>
+                          <span className="font-medium">Consumo anual:</span>{" "}
+                          {ocrAnnual > 0 ? `${Math.round(ocrAnnual).toLocaleString()} kWh` : "—"}{" "}
+                          <span className="text-neutral-500">
+                            ({ocrMonthsUsed > 0 ? `usó ${ocrMonthsUsed} mes(es)` : "sin OCR"})
+                          </span>
+                        </div>
+                        <div>
+                          <span className="font-medium">OCR confianza:</span>{" "}
+                          {ocrConfidence > 0 ? `${round2(ocrConfidence)}%` : "—"}
+                        </div>
+                      </>
+                    )}
+                  </div>
 
-      {/* Resultados PV */}
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 16 }}>
-        <h2 style={{ fontSize: 16, marginTop: 0 }}>Resultado PV</h2>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(220px, 1fr))", gap: 12 }}>
-          <Stat label="Consumo mensual (prom.)" value={`${formatNumber(monthlyKwh, 2)} kWh`} />
-          <Stat label="Sistema recomendado" value={`${formatNumber(pvKw, 2)} kW`} sub={`${panelCount} paneles (est.)`} />
-          <Stat label="PV (sin batería)" value={formatMoney(pvTotalNoBattery)} />
-        </div>
+                  {ocrError && (
+                    <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                      {ocrError}
+                    </div>
+                  )}
+                </div>
 
-        <div style={{ marginTop: 10, fontSize: 13, color: "#666" }}>
-          * Estimado preliminar. Validación final requiere inspección.
-        </div>
-      </section>
+                <div className="rounded-xl border border-neutral-200 p-3">
+                  <div className="text-xs font-medium text-neutral-600">Preview</div>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <div className="rounded-lg border border-neutral-200 p-1">
+                      <div className="px-1 pb-1 text-[10px] text-neutral-500">Página (raw)</div>
+                      {rawImageUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img alt="raw" src={rawImageUrl} className="h-28 w-full rounded-md object-cover" />
+                      ) : (
+                        <div className="flex h-28 items-center justify-center rounded-md bg-neutral-50 text-xs text-neutral-400">
+                          —
+                        </div>
+                      )}
+                    </div>
 
-      {/* Batería */}
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14 }}>
-        <h2 style={{ fontSize: 16, marginTop: 0 }}>Batería</h2>
+                    <div className="rounded-lg border border-neutral-200 p-1">
+                      <div className="px-1 pb-1 text-[10px] text-neutral-500">Auto-crop (números)</div>
+                      {previewLabelsUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img alt="labels" src={previewLabelsUrl} className="h-28 w-full rounded-md object-cover" />
+                      ) : (
+                        <div className="flex h-28 items-center justify-center rounded-md bg-neutral-50 text-xs text-neutral-400">
+                          —
+                        </div>
+                      )}
+                    </div>
+                  </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(220px, 1fr))", gap: 12, marginBottom: 12 }}>
-          <Field label="Cargas críticas (kW típico)" value={criticalKw} onChange={setCriticalKw} step="0.1" />
-          <Field label="Horas de respaldo" value={backupHours} onChange={setBackupHours} step="1" />
-        </div>
+                  <div className="mt-3 text-[11px] text-neutral-500">
+                    Nota: el auto-crop descarta el eje Y por posición (margen izquierdo), aunque los números del eje cambien.
+                    Solo intenta leer los numeritos arriba de cada barra.
+                  </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(220px, 1fr))", gap: 12 }}>
-          {batteryCards.map((b) => (
-            <div key={b.kwh} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <b>{b.kwh} kWh</b>
-                {b.kwh === recommendedBatteryKwh && (
-                  <span style={{ fontSize: 12, color: "#0a7", border: "1px solid #0a7", padding: "2px 8px", borderRadius: 999 }}>
-                    Recomendado
-                  </span>
-                )}
-              </div>
-              <div style={{ marginTop: 8, fontSize: 13 }}>
-                Batería: {formatMoney(b.battCost)}
-                <br />
-                Total PV + Batería: <b>{formatMoney(b.total)}</b>
-                <br />
-                Respaldo est.: {formatNumber(b.estHours, 1)} hrs
+                  <details className="mt-3">
+                    <summary className="cursor-pointer text-xs font-medium text-neutral-700">
+                      Debug OCR (valores detectados)
+                    </summary>
+                    <div className="mt-2 text-xs text-neutral-600">
+                      {ocrValuesDebug.length ? ocrValuesDebug.join(", ") : "—"}
+                    </div>
+                  </details>
+                </div>
               </div>
             </div>
-          ))}
+          </div>
+
+          {/* Assumptions */}
+          <div className="rounded-2xl border border-neutral-200 p-4 shadow-sm">
+            <div className="text-lg font-semibold">Supuestos del sistema</div>
+
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <div>
+                <div className="text-xs font-medium text-neutral-600">Offset (%)</div>
+                <input
+                  value={offsetPct}
+                  onChange={(e) => setOffsetPct(parseFloat(e.target.value || "0"))}
+                  inputMode="decimal"
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <div className="text-xs font-medium text-neutral-600">PSH</div>
+                <input
+                  value={psh}
+                  onChange={(e) => setPsh(parseFloat(e.target.value || "0"))}
+                  inputMode="decimal"
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <div className="text-xs font-medium text-neutral-600">Pérdidas (factor)</div>
+                <input
+                  value={lossFactor}
+                  onChange={(e) => setLossFactor(parseFloat(e.target.value || "0"))}
+                  inputMode="decimal"
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <div className="text-xs font-medium text-neutral-600">Panel (W)</div>
+                <input
+                  value={panelW}
+                  onChange={(e) => setPanelW(parseFloat(e.target.value || "0"))}
+                  inputMode="decimal"
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <div className="text-xs font-medium text-neutral-600">Techo</div>
+                <select
+                  value={roofType}
+                  onChange={(e) => setRoofType(e.target.value as any)}
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                >
+                  <option>Shingle</option>
+                  <option>Metal</option>
+                  <option>Concrete</option>
+                  <option>Other</option>
+                </select>
+              </div>
+
+              <div>
+                <div className="text-xs font-medium text-neutral-600">Permisos (est.)</div>
+                <input
+                  value={permits}
+                  onChange={(e) => setPermits(parseFloat(e.target.value || "0"))}
+                  inputMode="decimal"
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <div className="text-xs font-medium text-neutral-600">Interconexión (est.)</div>
+                <input
+                  value={interconnection}
+                  onChange={(e) => setInterconnection(parseFloat(e.target.value || "0"))}
+                  inputMode="decimal"
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <div className="text-xs font-medium text-neutral-600">Misceláneo (%)</div>
+                <input
+                  value={miscPct}
+                  onChange={(e) => setMiscPct(parseFloat(e.target.value || "0"))}
+                  inputMode="decimal"
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                />
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-xl bg-neutral-50 p-3">
+              <div className="text-sm font-semibold">Resultado PV</div>
+              <div className="mt-3 grid grid-cols-3 gap-2">
+                <div className="rounded-lg bg-white p-3">
+                  <div className="text-[11px] text-neutral-500">Consumo mensual</div>
+                  <div className="mt-1 text-lg font-semibold">{monthlyForSizing ? `${round2(monthlyForSizing)} kWh` : "—"}</div>
+                </div>
+                <div className="rounded-lg bg-white p-3">
+                  <div className="text-[11px] text-neutral-500">Sistema recomendado</div>
+                  <div className="mt-1 text-lg font-semibold">{monthlyForSizing ? `${round2(pvKwRecommended)} kW` : "—"}</div>
+                  <div className="text-[11px] text-neutral-500">{monthlyForSizing ? `${panelsCount} paneles (est.)` : ""}</div>
+                </div>
+                <div className="rounded-lg bg-white p-3">
+                  <div className="text-[11px] text-neutral-500">PV (sin batería)</div>
+                  <div className="mt-1 text-lg font-semibold">{monthlyForSizing ? formatMoney(basePvCost) : "—"}</div>
+                </div>
+              </div>
+
+              <div className="mt-3 text-xs text-neutral-600">
+                <div>Base PV: {formatMoney(pvWattsRecommended * PV_PRICE_PER_W)}</div>
+                <div>Adder techo: {formatMoney(roofAdderCost)}</div>
+                <div>Permisos: {formatMoney(permits)}</div>
+                <div>Interconexión: {formatMoney(interconnection)}</div>
+                <div>Misceláneo: {formatMoney((pvWattsRecommended * PV_PRICE_PER_W * miscPct) / 100)}</div>
+              </div>
+            </div>
+          </div>
         </div>
-      </section>
 
-      {/* Manual crop modal */}
-      <CropModal
-        open={showManualCrop}
-        imageBlob={lastFileBlob}
-        onCancel={() => setShowManualCrop(false)}
-        onConfirm={async (cropped) => {
-          setShowManualCrop(false);
-          // Reintento OCR con recorte manual (sin auto-crop)
-          await runPipelineOnBlob(cropped, "manual");
-        }}
-      />
-    </main>
-  );
-}
+        {/* Battery */}
+        <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <div className="rounded-2xl border border-neutral-200 p-4 shadow-sm">
+            <div className="text-lg font-semibold">Batería</div>
 
-function Field({
-  label,
-  value,
-  onChange,
-  step,
-}: {
-  label: string;
-  value: number;
-  onChange: (n: number) => void;
-  step?: string;
-}) {
-  return (
-    <div>
-      <label style={{ fontSize: 12, color: "#666" }}>{label}</label>
-      <input
-        value={Number.isFinite(value) ? value : ""}
-        onChange={(e) => onChange(Number(e.target.value || 0))}
-        inputMode="decimal"
-        step={step || "1"}
-        style={{
-          width: "100%",
-          padding: 10,
-          borderRadius: 10,
-          border: "1px solid #ddd",
-          fontSize: 16,
-        }}
-      />
-    </div>
-  );
-}
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              <div>
+                <div className="text-xs font-medium text-neutral-600">Horas de respaldo</div>
+                <select
+                  value={backupHours}
+                  onChange={(e) => setBackupHours(parseFloat(e.target.value))}
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                >
+                  {[4, 6, 8, 10, 12].map((h) => (
+                    <option key={h} value={h}>
+                      {h} horas
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <div className="text-xs font-medium text-neutral-600">Cargas críticas (kW)</div>
+                <select
+                  value={criticalKw}
+                  onChange={(e) => setCriticalKw(parseFloat(e.target.value))}
+                  className="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm"
+                >
+                  {[1, 1.5, 2, 3, 5].map((k) => (
+                    <option key={k} value={k}>
+                      {k} kW (típico)
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
 
-function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
-  return (
-    <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
-      <div style={{ fontSize: 12, color: "#666" }}>{label}</div>
-      <div style={{ fontSize: 20, fontWeight: 700, marginTop: 6 }}>{value}</div>
-      {sub && <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>{sub}</div>}
+            <div className="mt-4 text-xs text-neutral-600">
+              Recomendación basada en respaldo: <span className="font-medium">{criticalKw} kW</span> por{" "}
+              <span className="font-medium">{backupHours} horas</span>.
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-neutral-200 p-4 shadow-sm">
+            <div className="text-lg font-semibold">Opciones de batería + precio final</div>
+            <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {batteryCards.map((b) => (
+                <div
+                  key={b.kwh}
+                  className={`rounded-xl border p-3 ${
+                    b.isRecommended ? "border-emerald-300 bg-emerald-50" : "border-neutral-200 bg-white"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-semibold">{b.kwh} kWh</div>
+                    {b.isRecommended ? (
+                      <span className="rounded-full bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white">
+                        Recomendado
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-neutral-500">Opción</span>
+                    )}
+                  </div>
+
+                  <div className="mt-2 text-xs text-neutral-700">
+                    Batería: {formatMoney(b.battCost)} <span className="text-neutral-500">(${SOLUNA_PRICE_PER_KWH}/kWh)</span>
+                  </div>
+                  <div className="text-xs text-neutral-700">Total (PV + batería): {formatMoney(b.total)}</div>
+                  <div className="mt-1 text-[11px] text-neutral-600">
+                    Horas est. a {criticalKw} kW: <span className="font-medium">{round2(b.estHours)} h</span>
+                  </div>
+
+                  {b.kwh >= 3000 ? (
+                    <div className="mt-2 text-xs text-red-600">Caso comercial: requiere estimado separado.</div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-8 text-xs text-neutral-500">
+          Consejo para OCR: usa buena luz, evita reflejos, y mantén toda la gráfica visible.
+        </div>
+      </div>
     </div>
   );
 }
