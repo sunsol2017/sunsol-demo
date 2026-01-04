@@ -403,37 +403,56 @@ function makeLabelROIs(chartNoYAxis: HTMLCanvasElement, bars: BarInfo[]): HTMLCa
 
 type OcrMonthResult = { value: number | null; confidence: number; raw: string };
 
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(label)), ms);
+    p.then((v) => {
+      clearTimeout(t);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+  });
+}
+
 async function createTesseractWorker(logger: (msg: string) => void) {
   const mod: any = await import("tesseract.js");
-  const createWorker = mod?.createWorker ?? mod?.default?.createWorker;
+  const createWorker = mod?.createWorker ?? mod?.default?.createWorker ?? mod?.default;
   if (!createWorker) throw new Error("No pude cargar createWorker() de tesseract.js.");
 
-  // Some versions: createWorker({ logger })
-  const worker = await createWorker({
-    logger: (m: any) => {
-      if (m?.status && typeof m?.progress === "number") {
-        logger(`${m.status} ${(m.progress * 100).toFixed(0)}%`);
-      }
-    },
-  });
+  // ✅ CLAVE: forzar CDN paths (evita que se quede pegado en Vercel/Android)
+  logger("Descargando motor OCR (worker/wasm/lang)...");
+  const worker = await withTimeout(
+    createWorker({
+      logger: (m: any) => {
+        if (m?.status && typeof m?.progress === "number") {
+          logger(`${m.status} ${(m.progress * 100).toFixed(0)}%`);
+        }
+      },
+      workerPath: "https://unpkg.com/tesseract.js@5.1.0/dist/worker.min.js",
+      corePath: "https://unpkg.com/tesseract.js-core@5.0.0/tesseract-core.wasm.js",
+      langPath: "https://tessdata.projectnaptha.com/4.0.0",
+    }),
+    25000,
+    "Tesseract: timeout cargando worker/wasm/lang. (Asset bloqueado o no accesible)."
+  );
 
-  // Support multiple versions safely
   if (worker.load) await worker.load();
   if (worker.loadLanguage) await worker.loadLanguage("eng");
   if (worker.initialize) await worker.initialize("eng");
-  else if (worker.reinitialize) await worker.reinitialize("eng");
 
   if (worker.setParameters) {
     await worker.setParameters({
       tessedit_char_whitelist: "0123456789",
       preserve_interword_spaces: "1",
-      // PSM 8 = single word, 7 = single text line (varies)
-      tessedit_pageseg_mode: "8",
+      tessedit_pageseg_mode: 8, // SINGLE_WORD
     });
   }
 
   return worker;
 }
+
 
 function parseDigitsOnly(text: string): string {
   return (text || "").replace(/[^\d]/g, "");
