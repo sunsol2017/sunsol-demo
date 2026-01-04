@@ -416,39 +416,43 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
-async function createTesseractWorker(logger: (msg: string) => void) {
+async function createTesseractWorker(logger: (msg: string) => void): Promise<any> {
   const mod: any = await import("tesseract.js");
-  const createWorker = mod?.createWorker ?? mod?.default?.createWorker ?? mod?.default;
+
+  // Forzamos any para evitar que TS lo infiera como unknown en build
+  const createWorker: any = mod?.createWorker ?? mod?.default?.createWorker;
   if (!createWorker) throw new Error("No pude cargar createWorker() de tesseract.js.");
 
-  // ✅ CLAVE: forzar CDN paths (evita que se quede pegado en Vercel/Android)
-  logger("Descargando motor OCR (worker/wasm/lang)...");
-  const worker = await withTimeout(
-    createWorker({
-      logger: (m: any) => {
-        if (m?.status && typeof m?.progress === "number") {
-          logger(`${m.status} ${(m.progress * 100).toFixed(0)}%`);
-        }
-      },
-      workerPath: "https://unpkg.com/tesseract.js@5.1.0/dist/worker.min.js",
-      corePath: "https://unpkg.com/tesseract.js-core@5.0.0/tesseract-core.wasm.js",
-      langPath: "https://tessdata.projectnaptha.com/4.0.0",
-    }),
-    25000,
-    "Tesseract: timeout cargando worker/wasm/lang. (Asset bloqueado o no accesible)."
-  );
+  const worker: any = await createWorker({
+    logger: (m: any) => {
+      try {
+        const status = m?.status ? String(m.status) : "";
+        const prog =
+          typeof m?.progress === "number" ? ` ${(m.progress * 100).toFixed(0)}%` : "";
+        if (status) logger(`${status}${prog}`);
+      } catch {
+        // no-op
+      }
+    },
+  });
 
-  if (worker.load) await worker.load();
-  if (worker.loadLanguage) await worker.loadLanguage("eng");
-  if (worker.initialize) await worker.initialize("eng");
+  // Compat: distintas versiones exponen APIs distintas
+  if (worker?.load) await worker.load();
+  if (worker?.loadLanguage) await worker.loadLanguage("eng");
+  if (worker?.initialize) await worker.initialize("eng");
+  else if (worker?.reinitialize) await worker.reinitialize("eng");
 
-  if (worker.setParameters) {
+  if (worker?.setParameters) {
     await worker.setParameters({
       tessedit_char_whitelist: "0123456789",
       preserve_interword_spaces: "1",
-      tessedit_pageseg_mode: 8, // SINGLE_WORD
+      tessedit_pageseg_mode: "8", // single word / single line (varía)
     });
   }
+
+  return worker;
+}
+
 
   return worker;
 }
