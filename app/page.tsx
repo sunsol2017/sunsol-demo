@@ -4,13 +4,12 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * Sunsol Demo – page.tsx
- * - Cámara + galería (Android Chrome)
- * - Auto-detección de la gráfica de LUMA (página 4) vía visión simple (sin depender del eje Y)
- * - OCR solo de los labels arriba de las barras (20–3000)
- * - Usa los 12 meses más recientes (si hay <12, estima anual = promedio * 12; mínimo 4 meses)
- * - Sin “recortar manual”
- *
- * Nota: Requiere tesseract.js instalado en el proyecto (ya lo tienes).
+ * FIXES:
+ * - Worker singleton (no recrear/terminate en cada OCR)
+ * - CDN paths para worker/core/lang (evita problemas de bundler + mejora carga en móvil)
+ * - Timeouts más altos para primera carga en Android
+ * - OCR solo de labels arriba de barras (20–3000) y usa los 12 más recientes
+ * - Sin “recorte manual”
  */
 
 // ----------------------------- helpers (canvas/image) -----------------------------
@@ -80,14 +79,12 @@ function getImageDataGray(c: HTMLCanvasElement) {
     const r = data[i],
       g = data[i + 1],
       b = data[i + 2];
-    // perceived luminance
     gray[p] = (0.2126 * r + 0.7152 * g + 0.0722 * b) | 0;
   }
   return { gray, w: c.width, h: c.height };
 }
 
 function tightInkCrop(src: HTMLCanvasElement): { canvas: HTMLCanvasElement; rect: { x: number; y: number; w: number; h: number } } {
-  // recorta márgenes grandes (no depende de números del eje Y)
   const small = downscaleCanvas(src, 900);
   const { gray, w, h } = getImageDataGray(small);
 
@@ -95,7 +92,6 @@ function tightInkCrop(src: HTMLCanvasElement): { canvas: HTMLCanvasElement; rect
     minY = h - 1,
     maxX = 0,
     maxY = 0;
-  // Umbral alto para detectar “tinta” (texto/gráfica) contra fondo blanco/gris claro
   const TH = 245;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -109,12 +105,10 @@ function tightInkCrop(src: HTMLCanvasElement): { canvas: HTMLCanvasElement; rect
     }
   }
 
-  // si no encontró nada, devuelve original
   if (minX >= maxX || minY >= maxY) {
     return { canvas: src, rect: { x: 0, y: 0, w: src.width, h: src.height } };
   }
 
-  // padding
   const pad = Math.round(Math.min(w, h) * 0.02);
   minX = clamp(minX - pad, 0, w - 1);
   minY = clamp(minY - pad, 0, h - 1);
@@ -155,9 +149,8 @@ function movingAverage(arr: number[], win = 5) {
 }
 
 function findBarSegments(gray: Uint8ClampedArray, w: number, h: number, y0: number, y1: number): Segment[] {
-  // Busca “barras” como columnas con muchos pixeles oscuros dentro de una ventana Y.
   const col = new Array(w).fill(0);
-  const TH = 175; // gris oscuro (barras/grid) – suficientemente bajo para ignorar fondo
+  const TH = 175;
   for (let y = y0; y < y1; y++) {
     const row = y * w;
     for (let x = 0; x < w; x++) {
@@ -166,8 +159,6 @@ function findBarSegments(gray: Uint8ClampedArray, w: number, h: number, y0: numb
   }
 
   const smooth = movingAverage(col, 7);
-
-  // threshold relativo a altura de ventana
   const winH = Math.max(1, y1 - y0);
   const colTh = Math.max(6, Math.round(winH * 0.12));
 
@@ -199,7 +190,6 @@ function findBarSegments(gray: Uint8ClampedArray, w: number, h: number, y0: numb
     if (width >= 6) segs.push({ x0: start, x1: end, strength });
   }
 
-  // Fusiona segmentos muy cercanos (por ruido)
   const merged: Segment[] = [];
   for (const s of segs) {
     const last = merged[merged.length - 1];
@@ -215,7 +205,6 @@ function findBarSegments(gray: Uint8ClampedArray, w: number, h: number, y0: numb
 }
 
 function scoreSegments(segs: Segment[]) {
-  // Preferimos 10–15 barras (LUMA suele ser 13, usaremos 12 más recientes)
   const n = segs.length;
   const nScore = n >= 10 && n <= 15 ? 100 : n >= 7 && n <= 18 ? 60 : 0;
   const strength = segs.reduce((a, s) => a + s.strength, 0);
@@ -223,14 +212,11 @@ function scoreSegments(segs: Segment[]) {
 }
 
 function detectGraphZone(src: HTMLCanvasElement) {
-  // 1) recorta márgenes grandes
   const { canvas: tight } = tightInkCrop(src);
 
-  // 2) usa un canvas pequeño para detectar zona de barras (rápido)
   const small = downscaleCanvas(tight, 900);
   const { gray, w, h } = getImageDataGray(small);
 
-  // prueba varias ventanas Y (por variación de fotos)
   const candidates = [0.15, 0.25, 0.35, 0.45].map((p) => Math.round(h * p));
   const yEnd = Math.round(h * 0.92);
 
@@ -238,13 +224,10 @@ function detectGraphZone(src: HTMLCanvasElement) {
 
   for (const y0 of candidates) {
     const segs = findBarSegments(gray, w, h, y0, yEnd);
-    // descarta “eje Y”/márgenes por la izquierda (aunque cambien números)
-    // pero sin matar el primer label (p.ej. 422). Lo hacemos luego con margen relativo.
     const sc = scoreSegments(segs);
     if (sc > best.score) best = { score: sc, y0, segs };
   }
 
-  // Si no detectó nada razonable, fallback a parte baja
   let segs = best.segs;
   let y0 = best.y0;
 
@@ -253,7 +236,6 @@ function detectGraphZone(src: HTMLCanvasElement) {
     segs = findBarSegments(gray, w, h, y0, yEnd);
   }
 
-  // bbox X basado en segmentos
   let minX = Math.round(w * 0.03);
   let maxX = Math.round(w * 0.98);
 
@@ -262,7 +244,6 @@ function detectGraphZone(src: HTMLCanvasElement) {
     maxX = segs.reduce((m, s) => Math.max(m, s.x1), 0);
   }
 
-  // bbox Y basado en “tinta” dentro del rango X
   const TH = 235;
   let minY = h - 1,
     maxY = 0;
@@ -282,17 +263,14 @@ function detectGraphZone(src: HTMLCanvasElement) {
     maxY = yEnd;
   }
 
-  // padding y
   const padY = Math.round(h * 0.02);
   minY = clamp(minY - padY, 0, h - 1);
   maxY = clamp(maxY + padY, 0, h - 1);
 
-  // En el crop final: descarta eje Y por POSICIÓN, no por números.
-  // Esto es clave para que el eje Y cambie (900/1500/3000...) y no afecte.
-  const discardLeft = Math.round(w * 0.075); // ~7.5% de la gráfica
+  // descartar eje Y por POSICIÓN (no por números)
+  const discardLeft = Math.round(w * 0.075);
   minX = clamp(minX + discardLeft, 0, w - 1);
 
-  // map a canvas grande (tight)
   const sx = tight.width / w;
   const sy = tight.height / h;
 
@@ -314,8 +292,6 @@ function detectGraphZone(src: HTMLCanvasElement) {
 }
 
 function estimateBarTop(gray: Uint8ClampedArray, w: number, h: number, seg: Segment) {
-  // Encuentra “tope de barra” evitando líneas de grid:
-  // buscamos la primera fila donde el % de pixeles oscuros dentro del segmento sea alto y sostenido.
   const TH = 165;
   const x0 = seg.x0,
     x1 = seg.x1;
@@ -343,7 +319,6 @@ function pickCandidateNumber(raw: string): number | null {
   const digits = (raw || "").replace(/[^\d]/g, "");
   if (!digits) return null;
 
-  // Preferimos 2–4 dígitos, 20–3000
   const tries: string[] = [];
   if (digits.length <= 4) tries.push(digits);
   else tries.push(digits.slice(-4), digits.slice(-3), digits.slice(-2));
@@ -366,46 +341,92 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 // ----------------------------- OCR (tesseract) -----------------------------
 type OcrWorker = any;
 
-async function createTesseractWorker(logger: (msg: string) => void): Promise<OcrWorker> {
-  const mod: any = await import("tesseract.js");
-  const createWorker: any = mod?.createWorker ?? mod?.default?.createWorker ?? mod?.default ?? mod?.createWorker;
+// CDN paths (evita problemas de rutas en Next/Turbopack en móvil)
+const TESS_CDN = {
+  // jsdelivr suele ir bien en móviles
+  workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.0.5/dist/worker.min.js",
+  corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.0.0/tesseract-core.wasm.js",
+  langPath: "https://tessdata.projectnaptha.com/4.0.0",
+};
 
-  if (!createWorker) throw new Error("No pude cargar createWorker() de tesseract.js");
+// Singleton worker (clave para que NO timeoutee y no “re-cargue” siempre)
+let _workerPromise: Promise<OcrWorker> | null = null;
+let _worker: OcrWorker | null = null;
 
-  // Soporta firmas distintas entre versiones
-  const worker: any = await withTimeout(
-    createWorker({
-      logger: (m: any) => {
-        if (m?.status) logger(`${m.status}${typeof m.progress === "number" ? ` ${(m.progress * 100).toFixed(0)}%` : ""}`);
-      },
-    }),
-    25000,
-    "createWorker"
-  );
+async function ensureTesseractWorker(logger: (msg: string) => void): Promise<OcrWorker> {
+  if (_worker) return _worker;
+  if (_workerPromise) return _workerPromise;
 
-  // Inicialización compatible
-  if (worker.load) await withTimeout(worker.load(), 25000, "worker.load");
-  if (worker.loadLanguage) await withTimeout(worker.loadLanguage("eng"), 25000, "worker.loadLanguage");
-  if (worker.initialize) await withTimeout(worker.initialize("eng"), 25000, "worker.initialize");
-  if (worker.reinitialize) await withTimeout(worker.reinitialize("eng"), 25000, "worker.reinitialize");
+  _workerPromise = (async () => {
+    const mod: any = await import("tesseract.js");
+    const createWorker: any = mod?.createWorker ?? mod?.default?.createWorker ?? mod?.default ?? mod?.createWorker;
+    if (!createWorker) throw new Error("No pude cargar createWorker() de tesseract.js");
 
-  if (worker.setParameters) {
-    await withTimeout(
-      worker.setParameters({
-        tessedit_char_whitelist: "0123456789",
-        preserve_interword_spaces: "1",
-      }),
-      20000,
-      "worker.setParameters"
-    );
+    const make = async (useCdn: boolean) => {
+      const opts: any = { logger: (m: any) => m?.status && logger(`${m.status}${typeof m.progress === "number" ? ` ${(m.progress * 100).toFixed(0)}%` : ""}`) };
+      if (useCdn) {
+        opts.workerPath = TESS_CDN.workerPath;
+        opts.corePath = TESS_CDN.corePath;
+        opts.langPath = TESS_CDN.langPath;
+      }
+
+      // createWorker a veces devuelve worker directo (sync) o promise, por eso Promise.resolve
+      const maybe = createWorker(opts);
+      const w = await withTimeout(Promise.resolve(maybe), 120000, useCdn ? "createWorker(CDN)" : "createWorker(local)");
+      return w;
+    };
+
+    let worker: any;
+    try {
+      // 1) intenta normal
+      worker = await make(false);
+    } catch {
+      // 2) fallback CDN (más confiable en Vercel/Next)
+      worker = await make(true);
+    }
+
+    // init compatible multi-version
+    if (worker.load) await withTimeout(worker.load(), 120000, "worker.load");
+    if (worker.loadLanguage) await withTimeout(worker.loadLanguage("eng"), 120000, "worker.loadLanguage");
+    if (worker.initialize) await withTimeout(worker.initialize("eng"), 120000, "worker.initialize");
+    if (worker.reinitialize) await withTimeout(worker.reinitialize("eng"), 120000, "worker.reinitialize");
+
+    if (worker.setParameters) {
+      await withTimeout(
+        worker.setParameters({
+          tessedit_char_whitelist: "0123456789",
+          preserve_interword_spaces: "1",
+        }),
+        60000,
+        "worker.setParameters"
+      );
+    }
+
+    _worker = worker;
+    return worker;
+  })();
+
+  try {
+    return await _workerPromise;
+  } catch (e) {
+    _workerPromise = null;
+    _worker = null;
+    throw e;
   }
+}
 
-  return worker;
+async function terminateTesseractWorker() {
+  try {
+    if (_worker?.terminate) await _worker.terminate();
+  } catch {
+    // ignore
+  } finally {
+    _worker = null;
+    _workerPromise = null;
+  }
 }
 
 async function ocrSingleNumber(worker: OcrWorker, roi: HTMLCanvasElement) {
-  // OCR de UNA etiqueta (línea corta)
-  // PSM 7 = single line (si no existe, no importa)
   if (worker.setParameters) {
     await worker.setParameters({
       tessedit_pageseg_mode: "7",
@@ -413,11 +434,9 @@ async function ocrSingleNumber(worker: OcrWorker, roi: HTMLCanvasElement) {
     });
   }
 
-  const result: any = await withTimeout(worker.recognize(roi), 25000, "recognize(roi)");
-
+  const result: any = await withTimeout(worker.recognize(roi), 60000, "recognize(roi)");
   const text = (result?.data?.text ?? "").trim();
   const conf = Number(result?.data?.confidence ?? 0);
-
   const n = pickCandidateNumber(text);
 
   return { n, text, conf: Number.isFinite(conf) ? conf : 0 };
@@ -448,30 +467,25 @@ async function runLumaBarLabelOcr(
 
   if (isCanceled()) throw new Error("OCR cancelado");
 
-  // Para detección de barras trabajamos en un gráfico reducido (rápido),
-  // pero el OCR lo haremos sobre ROIs del canvas original del gráfico (mejor calidad).
   const graphSmall = downscaleCanvas(graph, 1000);
   const { gray, w, h } = getImageDataGray(graphSmall);
 
-  // Ventana Y donde suelen estar las barras (evita el “line chart” abajo si existe)
   const y0 = Math.round(h * 0.12);
   const y1 = Math.round(h * 0.78);
 
   let segs = findBarSegments(gray, w, h, y0, y1);
 
-  // Si detecta demasiado (ruido), conserva los más “fuertes”
   if (segs.length > 18) segs = segs.sort((a, b) => b.strength - a.strength).slice(0, 18);
-
-  // Ordena por X (izq->der)
   segs = segs.sort((a, b) => a.x0 - b.x0);
 
-  debug.push(`barSegments: ${segs.length}`);
+  // Solo OCR a las 12 barras más recientes (derecha) -> MUCHÍSIMO más rápido
+  if (segs.length > 12) segs = segs.slice(-12);
 
-  // Mapea a coords del gráfico grande
+  debug.push(`barSegments(used): ${segs.length}`);
+
   const sx = graph.width / graphSmall.width;
   const sy = graph.height / graphSmall.height;
 
-  // Crea “preview” de labels (para UI)
   const labelPreview = document.createElement("canvas");
   labelPreview.width = graphSmall.width;
   labelPreview.height = graphSmall.height;
@@ -480,106 +494,70 @@ async function runLumaBarLabelOcr(
   pctx.fillRect(0, 0, labelPreview.width, labelPreview.height);
   pctx.drawImage(graphSmall, 0, 0);
 
-  // Worker
-  setLog("Cargando OCR…");
-  const worker = await createTesseractWorker((m) => {
+  // SINGLETON worker
+  setLog("Cargando OCR… (solo la 1ra vez tarda más)");
+  const worker = await ensureTesseractWorker((m) => {
     if (!isCanceled()) setLog(m);
   });
 
-  try {
+  if (isCanceled()) throw new Error("OCR cancelado");
+
+  setLog("Leyendo labels arriba de las barras…");
+  const candidates: { xCenter: number; value: number; conf: number; raw: string }[] = [];
+
+  for (let i = 0; i < segs.length; i++) {
     if (isCanceled()) throw new Error("OCR cancelado");
+    if (requestId === -1) throw new Error("OCR cancelado");
 
-    setLog("Leyendo labels arriba de las barras…");
+    const seg = segs[i];
+    const topY = estimateBarTop(gray, w, h, seg);
 
-    const candidates: { xCenter: number; value: number; conf: number; raw: string }[] = [];
+    const segW = seg.x1 - seg.x0 + 1;
+    const labelH = clamp(Math.round(h * 0.10), 22, 70);
+    const pad = Math.round(labelH * 0.15);
 
-    // Procesa cada barra -> ROI justo arriba del tope
-    for (let i = 0; i < segs.length; i++) {
-      if (isCanceled()) throw new Error("OCR cancelado");
-      if (requestId === -1) throw new Error("OCR cancelado");
+    const lx0s = clamp(seg.x0 - Math.round(segW * 0.15), 0, w - 1);
+    const lx1s = clamp(seg.x1 + Math.round(segW * 0.15), 0, w - 1);
+    const ly1s = clamp(topY - pad, 0, h - 1);
+    const ly0s = clamp(ly1s - labelH, 0, h - 1);
 
-      const seg = segs[i];
+    pctx.strokeStyle = "rgba(255,0,0,0.7)";
+    pctx.lineWidth = 2;
+    pctx.strokeRect(lx0s, ly0s, lx1s - lx0s, ly1s - ly0s);
 
-      // Bar top estimado en SMALL coords
-      const topY = estimateBarTop(gray, w, h, seg);
+    const lx0 = Math.round(lx0s * sx);
+    const lx1 = Math.round(lx1s * sx);
+    const ly0 = Math.round(ly0s * sy);
+    const ly1 = Math.round(ly1s * sy);
 
-      // ROI para el label (en small)
-      const segW = seg.x1 - seg.x0 + 1;
-      const labelH = clamp(Math.round(h * 0.10), 22, 70);
-      const pad = Math.round(labelH * 0.15);
+    const roi = cropCanvas(graph, lx0, ly0, Math.max(1, lx1 - lx0), Math.max(1, ly1 - ly0));
 
-      const lx0s = clamp(seg.x0 - Math.round(segW * 0.15), 0, w - 1);
-      const lx1s = clamp(seg.x1 + Math.round(segW * 0.15), 0, w - 1);
-      const ly1s = clamp(topY - pad, 0, h - 1);
-      const ly0s = clamp(ly1s - labelH, 0, h - 1);
+    const roiScaled = document.createElement("canvas");
+    const scale = 2;
+    roiScaled.width = roi.width * scale;
+    roiScaled.height = roi.height * scale;
+    const rctx = roiScaled.getContext("2d")!;
+    rctx.imageSmoothingEnabled = false;
+    rctx.drawImage(roi, 0, 0, roiScaled.width, roiScaled.height);
 
-      // Dibuja rect en preview
-      pctx.strokeStyle = "rgba(255,0,0,0.7)";
-      pctx.lineWidth = 2;
-      pctx.strokeRect(lx0s, ly0s, lx1s - lx0s, ly1s - ly0s);
+    const out = await ocrSingleNumber(worker, roiScaled);
 
-      // ROI en gráfico GRANDE
-      const lx0 = Math.round(lx0s * sx);
-      const lx1 = Math.round(lx1s * sx);
-      const ly0 = Math.round(ly0s * sy);
-      const ly1 = Math.round(ly1s * sy);
+    const value = out.n;
+    const xCenter = (seg.x0 + seg.x1) / 2;
 
-      const roi = cropCanvas(graph, lx0, ly0, Math.max(1, lx1 - lx0), Math.max(1, ly1 - ly0));
+    if (value != null) candidates.push({ xCenter, value, conf: out.conf, raw: out.text });
 
-      // Aumenta un poco el ROI (mejor OCR)
-      const roiScaled = document.createElement("canvas");
-      const scale = 2;
-      roiScaled.width = roi.width * scale;
-      roiScaled.height = roi.height * scale;
-      const rctx = roiScaled.getContext("2d")!;
-      rctx.imageSmoothingEnabled = false;
-      rctx.drawImage(roi, 0, 0, roiScaled.width, roiScaled.height);
+    debug.push(`roi#${i}: raw="${out.text}" -> ${value ?? "null"} (conf ${toFixedSmart(out.conf, 1)})`);
+  }
 
-      const out = await ocrSingleNumber(worker, roiScaled);
+  const ordered = candidates.sort((a, b) => a.xCenter - b.xCenter);
+  const detectedAll = ordered.map((o) => o.value);
 
-      const value = out.n;
-      const xCenter = (seg.x0 + seg.x1) / 2;
+  const usedLast12 = detectedAll.length > 12 ? detectedAll.slice(-12) : detectedAll;
 
-      if (value != null) {
-        candidates.push({ xCenter, value, conf: out.conf, raw: out.text });
-      }
+  const confAvg = ordered.length ? ordered.reduce((a, o) => a + o.conf, 0) / ordered.length : 0;
 
-      debug.push(`roi#${i}: raw="${out.text}" -> ${value ?? "null"} (conf ${toFixedSmart(out.conf, 1)})`);
-    }
-
-    // Ordena por X y toma valores
-    const ordered = candidates.sort((a, b) => a.xCenter - b.xCenter);
-
-    const detectedAll = ordered.map((o) => o.value);
-
-    // Usa 12 más recientes (derecha)
-    const usedLast12 = detectedAll.length > 12 ? detectedAll.slice(-12) : detectedAll;
-
-    // Validación mínima
-    if (usedLast12.length < 4) {
-      const confAvg = ordered.length ? ordered.reduce((a, o) => a + o.conf, 0) / ordered.length : 0;
-      return {
-        graphZone: graph,
-        labelPreview,
-        result: {
-          detectedAll,
-          usedLast12,
-          monthsUsed: usedLast12.length,
-          avgMonthly: 0,
-          annualKwh: 0,
-          estimatedAnnual: true,
-          confidenceAvg: confAvg,
-          debug,
-        },
-      };
-    }
-
-    const sum = usedLast12.reduce((a, v) => a + v, 0);
-    const avgMonthly = sum / usedLast12.length;
-    const annualReal = usedLast12.length >= 12;
-    const annualKwh = annualReal ? sum : avgMonthly * 12;
-    const confidenceAvg = ordered.length ? ordered.reduce((a, o) => a + o.conf, 0) / ordered.length : 0;
-
+  if (usedLast12.length < 4) {
     return {
       graphZone: graph,
       labelPreview,
@@ -587,20 +565,34 @@ async function runLumaBarLabelOcr(
         detectedAll,
         usedLast12,
         monthsUsed: usedLast12.length,
-        avgMonthly,
-        annualKwh: Math.round(annualKwh),
-        estimatedAnnual: !annualReal,
-        confidenceAvg,
+        avgMonthly: 0,
+        annualKwh: 0,
+        estimatedAnnual: true,
+        confidenceAvg: confAvg,
         debug,
       },
     };
-  } finally {
-    try {
-      if (worker?.terminate) await worker.terminate();
-    } catch {
-      // ignore
-    }
   }
+
+  const sum = usedLast12.reduce((a, v) => a + v, 0);
+  const avgMonthly = sum / usedLast12.length;
+  const annualReal = usedLast12.length >= 12;
+  const annualKwh = annualReal ? sum : avgMonthly * 12;
+
+  return {
+    graphZone: graph,
+    labelPreview,
+    result: {
+      detectedAll,
+      usedLast12,
+      monthsUsed: usedLast12.length,
+      avgMonthly,
+      annualKwh: Math.round(annualKwh),
+      estimatedAnnual: !annualReal,
+      confidenceAvg: confAvg,
+      debug,
+    },
+  };
 }
 
 // ----------------------------- Main Page -----------------------------
@@ -644,6 +636,13 @@ export default function Page() {
   // OCR request cancelation
   const reqRef = useRef(0);
 
+  useEffect(() => {
+    // cleanup al salir de la página (opcional)
+    return () => {
+      terminateTesseractWorker();
+    };
+  }, []);
+
   const effectiveMonthly = useMemo(() => {
     if (manualMonthly !== "" && Number.isFinite(Number(manualMonthly))) return Number(manualMonthly);
     if (avgMonthlyOcr != null && Number.isFinite(avgMonthlyOcr)) return avgMonthlyOcr;
@@ -651,12 +650,10 @@ export default function Page() {
   }, [manualMonthly, avgMonthlyOcr]);
 
   const sizing = useMemo(() => {
-    // anual
     const annualKwh = annualOcr && annualOcr > 0 ? annualOcr : effectiveMonthly > 0 ? effectiveMonthly * 12 : 0;
 
-    // pv needed to cover offset
     const targetAnnual = annualKwh * (offsetPct / 100);
-    const kwhPerKwYear = psh * 365 * lossFactor; // aproximación
+    const kwhPerKwYear = psh * 365 * lossFactor;
     const pvKw = kwhPerKwYear > 0 ? targetAnnual / kwhPerKwYear : 0;
 
     const panels = panelW > 0 ? Math.ceil((pvKw * 1000) / panelW) : 0;
@@ -665,7 +662,6 @@ export default function Page() {
     const misc = 0.03 * basePvCost;
     const pvCostTotal = basePvCost + permits + interconnection + misc;
 
-    // battery sizing simple
     const usable = 0.9;
     const batteryKwh = usable > 0 ? (criticalKw * backupHours) / usable : 0;
 
@@ -695,15 +691,11 @@ export default function Page() {
 
     setRawFileName(file.name);
 
-    // preview raw
     const img = await loadImageFromFile(file);
     const pageCanvas = canvasFromImage(img, 1800);
-    const rawUrl = canvasToDataUrl(pageCanvas, 0.85);
-    setRawPreview(rawUrl);
+    setRawPreview(canvasToDataUrl(pageCanvas, 0.85));
 
-    // OCR run
     const myReq = ++reqRef.current;
-
     const isCanceled = () => reqRef.current !== myReq;
 
     try {
@@ -732,7 +724,9 @@ export default function Page() {
       setDebugLines(result.debug);
 
       if (result.monthsUsed < 4) {
-        setOcrError("OCR insuficiente: se detectaron menos de 4 meses. Toma la foto más nítida y completa (página 4), o escribe el kWh mensual promedio manualmente.");
+        setOcrError(
+          "OCR insuficiente: se detectaron menos de 4 meses. Toma la foto más nítida y completa (página 4), o escribe el kWh mensual promedio manualmente."
+        );
       } else {
         setOcrStatus("OCR listo ✅");
       }
@@ -763,12 +757,8 @@ export default function Page() {
   }
 
   function reprocesar() {
-    // Si tienes preview raw, reusa el dataURL como imagen para re-run
-    // (más simple: pide que el usuario vuelva a seleccionar; pero aquí reintentamos)
     if (!rawPreview) return;
-    reqRef.current++;
     const myReq = ++reqRef.current;
-
     const isCanceled = () => reqRef.current !== myReq;
 
     (async () => {
@@ -810,7 +800,9 @@ export default function Page() {
         setDebugLines(result.debug);
 
         if (result.monthsUsed < 4) {
-          setOcrError("OCR insuficiente: se detectaron menos de 4 meses. Toma la foto más nítida y completa (página 4), o escribe el kWh mensual promedio manualmente.");
+          setOcrError(
+            "OCR insuficiente: se detectaron menos de 4 meses. Toma la foto más nítida y completa (página 4), o escribe el kWh mensual promedio manualmente."
+          );
         } else {
           setOcrStatus("OCR listo ✅");
         }
@@ -822,25 +814,22 @@ export default function Page() {
     })();
   }
 
-  // Inputs refs (camera/gallery)
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
 
-  // ----------------------------- UI -----------------------------
   return (
     <main className="min-h-screen bg-white text-gray-900">
       <div className="mx-auto max-w-5xl px-4 py-8">
         <div className="flex flex-col gap-2">
           <h1 className="text-2xl font-semibold">Sunsol · Cotizador (sin vendedor)</h1>
           <div className="text-sm text-gray-600">
-            <span className="font-medium">Foto / Screenshot de LUMA (página 4)</span>: usamos la gráfica{" "}
-            <span className="font-semibold">“CONSUMPTION HISTORY (KWH)”</span> / <span className="font-semibold">“Historial de consumo”</span>.
-            Toma la <span className="font-semibold">página completa</span>, nítida y sin reflejos.
+            <span className="font-medium">Foto / Screenshot de LUMA (página 4)</span>: usa la gráfica{" "}
+            <span className="font-semibold">“CONSUMPTION HISTORY (KWH)”</span> / <span className="font-semibold">“Historial de consumo”</span>. Toma la{" "}
+            <span className="font-semibold">página completa</span>, nítida y sin reflejos.
           </div>
         </div>
 
         <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
-          {/* Uploader */}
           <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
             <div className="flex items-center justify-between">
               <h2 className="text-base font-semibold">Foto / Screenshot de LUMA</h2>
@@ -911,9 +900,7 @@ export default function Page() {
                   {annualOcr && annualOcr > 0 ? (
                     <>
                       {annualOcr.toLocaleString()} kWh{" "}
-                      <span className="text-xs text-gray-500">
-                        ({estimatedAnnual ? `estimado con ${monthsUsed} mes(es) × 12` : `12m real`})
-                      </span>
+                      <span className="text-xs text-gray-500">({estimatedAnnual ? `estimado con ${monthsUsed} mes(es) × 12` : `12m real`})</span>
                     </>
                   ) : (
                     <span className="text-gray-500">— (sin OCR)</span>
@@ -926,9 +913,7 @@ export default function Page() {
               </div>
 
               {ocrStatus ? (
-                <div className="mt-3 rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700">
-                  {ocrStatus}
-                </div>
+                <div className="mt-3 rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700">{ocrStatus}</div>
               ) : null}
 
               {ocrError ? (
@@ -957,15 +942,14 @@ export default function Page() {
             <div className="mt-4 rounded-xl border border-gray-200 bg-gray-50 p-3 text-xs text-gray-700">
               <div className="font-semibold">Nota (importante)</div>
               <div className="mt-1">
-                El auto-crop <span className="font-semibold">descarta el eje Y por posición</span> (margen izquierdo), aunque cambien sus números.
-                Solo intenta leer los <span className="font-semibold">numeritos arriba de las barras</span>.
+                El auto-crop <span className="font-semibold">descarta el eje Y por posición</span> (margen izquierdo), aunque cambien sus números. Solo
+                intenta leer los <span className="font-semibold">numeritos arriba de las barras</span>.
               </div>
               <div className="mt-1">
                 Si faltan meses en la factura, usa los disponibles (mínimo 4) y estima el anual con <span className="font-semibold">promedio × 12</span>.
               </div>
             </div>
 
-            {/* Preview */}
             <div className="mt-5">
               <div className="text-sm font-semibold">Preview</div>
               <div className="mt-2 grid grid-cols-3 gap-3">
@@ -974,11 +958,7 @@ export default function Page() {
                 <PreviewCard title="OCR (labels arriba de barras)" src={labelsPreview} />
               </div>
 
-              <button
-                type="button"
-                className="mt-3 text-xs font-semibold text-gray-700 underline"
-                onClick={() => setOcrDebugOpen((v) => !v)}
-              >
+              <button type="button" className="mt-3 text-xs font-semibold text-gray-700 underline" onClick={() => setOcrDebugOpen((v) => !v)}>
                 {ocrDebugOpen ? "Ocultar debug OCR" : "Ver debug OCR (detalles)"}
               </button>
 
@@ -999,7 +979,6 @@ export default function Page() {
             </div>
           </section>
 
-          {/* Calculator */}
           <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
             <h2 className="text-base font-semibold">Supuestos del sistema</h2>
 
@@ -1018,7 +997,11 @@ export default function Page() {
 
               <div className="mt-3 grid grid-cols-3 gap-3">
                 <Stat label="Consumo mensual" value={effectiveMonthly > 0 ? `${toFixedSmart(effectiveMonthly, 2)} kWh` : "0 kWh"} />
-                <Stat label="Sistema recomendado" value={sizing.pvKw > 0 ? `${toFixedSmart(sizing.pvKw, 2)} kW` : "0 kW"} sub={sizing.panels ? `${sizing.panels} paneles (est.)` : "0 paneles"} />
+                <Stat
+                  label="Sistema recomendado"
+                  value={sizing.pvKw > 0 ? `${toFixedSmart(sizing.pvKw, 2)} kW` : "0 kW"}
+                  sub={sizing.panels ? `${sizing.panels} paneles (est.)` : "0 paneles"}
+                />
                 <Stat
                   label="PV (sin batería)"
                   value={sizing.pvCostTotal > 0 ? `$${Math.round(sizing.pvCostTotal).toLocaleString()}` : "$0"}
@@ -1026,9 +1009,7 @@ export default function Page() {
                 />
               </div>
 
-              <div className="mt-4 text-xs text-gray-600">
-                * Cálculo aproximado: kW = (kWh anual × offset) / (PSH × 365 × pérdidas).
-              </div>
+              <div className="mt-4 text-xs text-gray-600">* Cálculo aproximado: kW = (kWh anual × offset) / (PSH × 365 × pérdidas).</div>
             </div>
 
             <div className="mt-6 rounded-2xl border border-gray-200 bg-white p-4">
@@ -1043,9 +1024,7 @@ export default function Page() {
                 <span className="font-semibold">Recomendado:</span> {sizing.batteryKwh > 0 ? `${toFixedSmart(sizing.batteryKwh, 1)} kWh` : "0 kWh"}
               </div>
 
-              <div className="mt-2 text-xs text-gray-500">
-                * Aproximación: kWh = (kW × horas) / 0.9 (usable).
-              </div>
+              <div className="mt-2 text-xs text-gray-500">* Aproximación: kWh = (kW × horas) / 0.9 (usable).</div>
             </div>
           </section>
         </div>
@@ -1059,9 +1038,7 @@ function PreviewCard({ title, src }: { title: string; src: string }) {
   return (
     <div className="rounded-xl border border-gray-200 bg-white p-3">
       <div className="text-xs font-semibold text-gray-700">{title}</div>
-      <div className="mt-2 aspect-[4/5] w-full overflow-hidden rounded-lg bg-gray-100">
-        {src ? <img src={src} alt={title} className="h-full w-full object-cover" /> : null}
-      </div>
+      <div className="mt-2 aspect-[4/5] w-full overflow-hidden rounded-lg bg-gray-100">{src ? <img src={src} alt={title} className="h-full w-full object-cover" /> : null}</div>
     </div>
   );
 }
